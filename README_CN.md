@@ -1,7 +1,7 @@
 PgSniffer是一个命令行工具，通过抓取PostgreSQL流量，计算出slow-sql-log
 
 <img src="https://github.com/c77cc/pgsniffer/blob/master/example.gif" width="30%" height="30%">
-[Origin Image](https://github.com/c77cc/pgsniffer/blob/master/example.gif)
+[Origin Image](https://raw.githubusercontent.com/c77cc/pgsniffer/master/example.gif)
 
 ## 解决了什么问题
 ---
