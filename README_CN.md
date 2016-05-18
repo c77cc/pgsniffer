@@ -33,7 +33,7 @@ GOOS=darwin GOARCH=amd64 go build -o pgsniffer sniffer.go
 #### Windows
 * 安装gcc <http://heanet.dl.sourceforge.net/project/mingw-w64/Toolchains%20targetting%20Win32/Personal%20Builds/mingw-builds/installer/mingw-w64-install.exe>
 * 安装pcap for windows <https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip> <http://www.winpcap.org/install/bin/WinPcap_4_1_3.exe>
-* 将WpdPack_4_1_2.zip解压到C:\
+* 将WpdPack_4_1_2.zip解压到C:\WpdPack
 * 目前Windows不支持监听127.0.0.1
 
 `Windows 64bit`

@@ -12,28 +12,27 @@ PgSniffer is a command-line tool, capture PostgreSQL network traffic, calculate 
 
 ## Compile Installation
 ---
-#### Linux
+#### Mac OS / Linux
 
-```
-`Universal`
 
-{OS}:windows, linux, drawin, freebsd
+{OS}:   windows, linux, drawin, freebsd
 
 {ARCH}: amd64, 386, arm
 
-```
+```bash
 GOOS={OS} GOARCH={ARCH} go build -o pgsniffer sniffer.go
 ```
 
-`Mac OS X 64bit`
+Mac OS X 64bit
 
 ```
 GOOS=darwin GOARCH=amd64 go build -o pgsniffer sniffer.go
+```
 
 #### Windows
 * Install gcc(mingw64bit) <http://heanet.dl.sourceforge.net/project/mingw-w64/Toolchains%20targetting%20Win32/Personal%20Builds/mingw-builds/installer/mingw-w64-install.exe>
 * Install pcap-devel for windows <https://www.winpcap.org/install/bin/WpdPack_4_1_2.zip> <http://www.winpcap.org/install/bin/WinPcap_4_1_3.exe>
-* Extract WpdPack_4_1_2.zip to C:\
+* Extract WpdPack_4_1_2.zip to C:\WpdPack
 * Currently not support listening 127.0.0.1 on Windows.
 
 `Windows 64bit`
