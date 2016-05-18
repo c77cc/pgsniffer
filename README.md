@@ -1,7 +1,7 @@
 PgSniffer is a command-line tool, capture PostgreSQL network traffic, calculate slow-sql-log.
 
-
-![image](https://github.com/c77cc/pgsniffer/blob/master/example.gif)
+<img src="https://github.com/c77cc/pgsniffer/blob/master/example.gif" width="30%" height="30%">
+[Origin Image](https://github.com/c77cc/pgsniffer/blob/master/example.gif)
 
 ## Why PgSniffer
 ---
