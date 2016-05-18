@@ -1,5 +1,8 @@
 PgSniffer is a command-line tool, capture PostgreSQL network traffic, calculate slow-sql-log.
 
+
+![image](https://github.com/c77cc/pgsniffer/blob/master/example.gif)
+
 ## Why PgSniffer
 ---
 * Forgot open log_min_duration_statement? Edit the configuration file and restart pg-server, so trouble...
@@ -8,12 +11,20 @@ PgSniffer is a command-line tool, capture PostgreSQL network traffic, calculate 
 
 ## Binary Installation
 ---
-* bin/ directory
+* [Mac OS 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.darwin64bit)
+* [Linux 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.linux64bit)
+* [Windows 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.win64bit.exe)
+
 
 ## Compile Installation
 ---
 #### Mac OS / Linux
 
+You need install libpcap on Linux platform.
+
+```
+yum install libpcap-devel -y
+```
 
 {OS}:   windows, linux, drawin, freebsd
 

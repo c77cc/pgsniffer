@@ -1,5 +1,7 @@
 PgSniffer是一个命令行工具，通过抓取PostgreSQL流量，计算出slow-sql-log
 
+![image](https://github.com/c77cc/pgsniffer/blob/master/example.gif)
+
 ## 解决了什么问题
 ---
 * 忘记开启log_min_duration_statement？修改配置文件再次重启pg-server，好麻烦。。。
@@ -8,11 +10,19 @@ PgSniffer是一个命令行工具，通过抓取PostgreSQL流量，计算出slow
 
 ## 二进制安装
 ---
-* bin/ 目录下载对应的二进制执行文件即可。
+* [Mac OS 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.darwin64bit)
+* [Linux 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.linux64bit)
+* [Windows 64bit](https://raw.githubusercontent.com/c77cc/pgsniffer/master/bin/pgsniffer.win64bit.exe)
 
 ## 编译安装
 ---
 #### linux
+
+Linux平台需要安装libpcap
+```
+yum install libpcap-devel -y
+```
+
 `通用版`
 
 {OS}:windows, linux, drawin, freebsd
