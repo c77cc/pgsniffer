@@ -63,11 +63,11 @@ sudo ./pgsniffer -i lo0 -f "tcp port 5432"
 ## Options
 ---
 ```
--i 		lo0						device interface
--l                              list all device interface
--f		"tcp port 5432"			port and direction
--n 		50						show top-n slowest sql
--v 								output all sqls captured
+-i         lo0                        device interface
+-l                                    list all device interface
+-f        "tcp port 5432"             port and direction
+-n         50                         show top-n slowest sql
+-v                                    output all sqls captured
 ```
 
 ### TODO

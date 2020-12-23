@@ -64,11 +64,11 @@ sudo ./pgsniffer -i lo0 -f "tcp port 5432"
 ## 可选参数
 ---
 ```
--i 		lo0						监听的网卡名称
--l                              列出所有网卡信息
--f		"tcp port 5432"			监听的端口
--n 		50						结果显示最慢的N条SQL
--v 								打印捕捉到的每一条SQL
+-i         lo0                        监听的网卡名称
+-l                                    列出所有网卡信息
+-f        "tcp port 5432"             监听的端口
+-n         50                         结果显示最慢的N条SQL
+-v                                    打印捕捉到的每一条SQL
 ```
 
 ### TODO
