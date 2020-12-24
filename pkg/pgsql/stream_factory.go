@@ -9,8 +9,8 @@ import (
 )
 
 type StreamFactory struct {
-	pgsqls map[uint64]*Pgsql
-	mux    sync.RWMutex
+	parsers map[uint64]*Parser
+	mux     sync.RWMutex
 }
 
 type StreamHandler struct {
@@ -21,7 +21,7 @@ var bufPool = sync.Pool{
 	New: func() interface{} { return make([]byte, MaxBufferSize) },
 }
 
-func (m *StreamHandler) run(cpgsql *Pgsql) {
+func (m *StreamHandler) run(cpgsql *Parser) {
 	var buf = []byte{}
 	var tmpbuf = bufPool.Get().([]byte)
 	defer bufPool.Put(tmpbuf)
@@ -55,20 +55,20 @@ func (f *StreamFactory) New(a, b gopacket.Flow) tcpassembly.Stream {
 	return &s.r
 }
 
-func (f *StreamFactory) pgsql(hash uint64) *Pgsql {
-	if p, found := f.pgsqls[hash]; found {
+func (f *StreamFactory) pgsql(hash uint64) *Parser {
+	if p, found := f.parsers[hash]; found {
 		return p
 	}
 
-	p := NewPgsql()
+	p := NewParser()
 	f.mux.Lock()
-	f.pgsqls[hash] = p
+	f.parsers[hash] = p
 	f.mux.Unlock()
 
-	return f.pgsqls[hash]
+	return f.parsers[hash]
 }
 
 func NewStreamFactory() *StreamFactory {
-	streamFactory := &StreamFactory{pgsqls: make(map[uint64]*Pgsql)}
+	streamFactory := &StreamFactory{parsers: make(map[uint64]*Parser)}
 	return streamFactory
 }

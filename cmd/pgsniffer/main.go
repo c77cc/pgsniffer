@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -71,10 +72,11 @@ func printAllDevices() {
 	}
 	fmt.Println("INTERFACES:")
 	for i := range ds {
-		if len(ds[i].Addresses) < 1 {
+		isLoopback := strings.Contains(strings.ToLower(ds[i].Name), `loopback`)
+		if len(ds[i].Addresses) < 1 && !isLoopback {
 			continue
 		}
-		fmt.Println(`name:`, ds[i].Name)
+		fmt.Println(`Interface:`, ds[i].Name)
 		fmt.Println(`Description:`, ds[i].Description)
 		fmt.Println(`Addresses:`, ds[i].Addresses)
 		fmt.Println(``)
