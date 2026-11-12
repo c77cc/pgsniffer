@@ -112,11 +112,10 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := os.Getenv("PGSNIFFER_E2E_ARTIFACTS")
-	retain := base != ""
-	if base == "" {
-		base = os.TempDir()
-	} else if err := os.MkdirAll(base, 0o755); err != nil {
+	configuredArtifacts := os.Getenv("PGSNIFFER_E2E_ARTIFACTS")
+	retain := configuredArtifacts != ""
+	base := artifactBase(repo, configuredArtifacts)
+	if err := os.MkdirAll(base, 0o755); err != nil {
 		t.Fatalf("create artifact directory: %v", err)
 	}
 	runDir, err := os.MkdirTemp(base, "run-")
