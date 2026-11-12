@@ -1,0 +1,8 @@
+/pgsniffer
+/bin/
+/dist/
+*.test
+*.out
+coverage.txt
+.DS_Store
+.artifacts/
