@@ -3,14 +3,21 @@
 package e2e
 
 import (
+	"archive/tar"
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/rsa"
 	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"os"
 	"os/exec"
@@ -158,17 +165,17 @@ func (h *harness) dockerUnavailable(message string) {
 
 func (h *harness) build() {
 	h.t.Helper()
-	h.run(h.repo, "go", "build", "-trimpath", "-o", h.binary, "./cmd/pgsniffer")
+	h.run(h.t, h.repo, "go", "build", "-trimpath", "-o", h.binary, "./cmd/pgsniffer")
 	tcpdump, err := exec.LookPath("tcpdump")
 	if err != nil {
 		h.t.Fatalf("tcpdump is required for E2E PCAP replay: %v", err)
 	}
 	h.tcpdump = tcpdump
 	if os.Getenv("PGSNIFFER_E2E_SETCAP") == "1" {
-		h.run(h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.binary)
-		h.run(h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.tcpdump)
+		h.run(h.t, h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.binary)
+		h.run(h.t, h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.tcpdump)
 	}
-	list := h.runOutput(h.repo, h.binary, "-l")
+	list := h.runOutput(h.t, h.repo, h.binary, "-l")
 	if !strings.Contains(list, h.iface) {
 		h.t.Fatalf("capture interface %q not found in:\n%s", h.iface, list)
 	}
@@ -302,8 +309,7 @@ func (h *harness) startPostgres(t *testing.T, tlsEnabled bool) (string, int) {
 		volume := name + "-certs"
 		h.docker(t, "volume", "create", volume)
 		h.resources = append(h.resources, dockerResource{kind: "volume", name: volume})
-		h.docker(t, "run", "--rm", "--entrypoint", "sh", "-v", volume+":/certs", h.image, "-ceu",
-			"openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost -keyout /certs/server.key -out /certs/server.crt >/dev/null 2>&1; chown postgres:postgres /certs/server.key /certs/server.crt; chmod 600 /certs/server.key")
+		h.populateTLSCertificate(t, volume)
 		args = append(args, "-v", volume+":/certs:ro")
 	}
 	args = append(args, h.image, "postgres")
@@ -321,6 +327,66 @@ func (h *harness) startPostgres(t *testing.T, tlsEnabled bool) (string, int) {
 	client.simple(t, "INSERT INTO e2e_account VALUES (1, 100) ON CONFLICT (id) DO UPDATE SET balance = EXCLUDED.balance")
 	client.close()
 	return name, port
+}
+
+func (h *harness) populateTLSCertificate(t *testing.T, volume string) {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generate TLS key: %v", err)
+	}
+	serialLimit := new(big.Int).Lsh(big.NewInt(1), 128)
+	serial, err := rand.Int(rand.Reader, serialLimit)
+	if err != nil {
+		t.Fatalf("generate TLS certificate serial: %v", err)
+	}
+	serial.Add(serial, big.NewInt(1))
+	now := time.Now()
+	template := x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "localhost"},
+		NotBefore:    now.Add(-time.Minute),
+		NotAfter:     now.Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"localhost"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+	}
+	certificate, err := x509.CreateCertificate(rand.Reader, &template, &template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatalf("create TLS certificate: %v", err)
+	}
+	files := []struct {
+		name string
+		mode int64
+		data []byte
+	}{
+		{"server.crt", 0o644, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certificate})},
+		{"server.key", 0o600, pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(key)})},
+	}
+	var archive bytes.Buffer
+	writer := tar.NewWriter(&archive)
+	for _, file := range files {
+		if err := writer.WriteHeader(&tar.Header{Name: file.name, Mode: file.mode, Size: int64(len(file.data))}); err != nil {
+			t.Fatalf("archive TLS certificate: %v", err)
+		}
+		if _, err := writer.Write(file.data); err != nil {
+			t.Fatalf("archive TLS certificate data: %v", err)
+		}
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("finish TLS certificate archive: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "docker", "run", "--rm", "-i", "--entrypoint", "sh", "-v", volume+":/certs", h.image,
+		"-ceu", "tar -x -C /certs; chown postgres:postgres /certs/server.key /certs/server.crt; chmod 600 /certs/server.key")
+	cmd.Dir = h.repo
+	cmd.Stdin = &archive
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("populate TLS certificate volume: %v\n%s", err, output)
+	}
 }
 
 func (h *harness) publishedPort(t *testing.T, container string) int {
@@ -379,7 +445,6 @@ func (h *harness) startCapture(t *testing.T, label string, port int) *capture {
 	}
 	cap.packetDone = make(chan error, 1)
 	go func() { cap.packetDone <- cap.packetCmd.Wait() }()
-	waitForPCAPHeader(t, cap)
 
 	args := []string{h.binary, "-i", h.iface, "--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "-n", "0"}
 	if os.Getenv("PGSNIFFER_E2E_SUDO") == "1" {
@@ -400,12 +465,12 @@ func (h *harness) startCapture(t *testing.T, label string, port int) *capture {
 		stopProcess(cap.packetCmd, cap.packetDone)
 		t.Fatalf("pgsniffer exited during startup: %v; stderr=%s", err, cap.stderr.String())
 	case <-time.After(150 * time.Millisecond):
-		return cap
 	}
+	waitForPCAPHeader(t, cap, port)
 	return cap
 }
 
-func waitForPCAPHeader(t *testing.T, cap *capture) {
+func waitForPCAPHeader(t *testing.T, cap *capture, port int) {
 	t.Helper()
 	deadline := time.NewTimer(10 * time.Second)
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -414,17 +479,24 @@ func waitForPCAPHeader(t *testing.T, cap *capture) {
 	for {
 		select {
 		case err := <-cap.packetDone:
+			stopProcess(cap.cmd, cap.cmdDone)
 			t.Fatalf("tcpdump exited during startup: %v; stderr=%s", err, cap.packetStderr.String())
+		case err := <-cap.cmdDone:
+			stopProcess(cap.packetCmd, cap.packetDone)
+			t.Fatalf("pgsniffer exited during startup: %v; stderr=%s", err, cap.stderr.String())
 		case <-ticker.C:
 			if info, err := os.Stat(cap.pcapPath); err == nil && info.Size() >= 24 {
-				select {
-				case err := <-cap.packetDone:
-					t.Fatalf("tcpdump exited during startup: %v; stderr=%s", err, cap.packetStderr.String())
-				case <-time.After(750 * time.Millisecond):
-					return
-				}
+				return
+			}
+			// tcpdump may keep the save-file header in its userspace buffer
+			// until the first matching packet. An empty connection wakes it up
+			// without adding a PostgreSQL request to either report.
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), 100*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
 			}
 		case <-deadline.C:
+			stopProcess(cap.cmd, cap.cmdDone)
 			stopProcess(cap.packetCmd, cap.packetDone)
 			t.Fatalf("tcpdump did not create a PCAP header; stderr=%s", cap.packetStderr.String())
 		}
@@ -466,7 +538,7 @@ func (h *harness) stopCapture(t *testing.T, cap *capture) report {
 func (h *harness) replay(t *testing.T, pcapPath string, port int, name string) report {
 	t.Helper()
 	path := filepath.Join(h.artifacts, name)
-	data := []byte(h.runOutput(h.repo, h.binary, "--read-pcap", pcapPath,
+	data := []byte(h.runOutput(t, h.repo, h.binary, "--read-pcap", pcapPath,
 		"--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "-n", "0"))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("retain replay report: %v", err)
@@ -578,7 +650,10 @@ func (h *harness) cleanup() {
 	}
 }
 
-func (h *harness) docker(t *testing.T, args ...string) { t.Helper(); h.run(h.repo, "docker", args...) }
+func (h *harness) docker(t *testing.T, args ...string) {
+	t.Helper()
+	h.run(t, h.repo, "docker", args...)
+}
 
 func (h *harness) dockerOutput(t *testing.T, args ...string) (string, error) {
 	t.Helper()
@@ -588,26 +663,26 @@ func (h *harness) dockerOutput(t *testing.T, args ...string) (string, error) {
 	return string(output), err
 }
 
-func (h *harness) run(dir, name string, args ...string) {
-	h.t.Helper()
+func (h *harness) run(t *testing.T, dir, name string, args ...string) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	if output, err := cmd.CombinedOutput(); err != nil {
-		h.t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, output)
+		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, output)
 	}
 }
 
-func (h *harness) runOutput(dir, name string, args ...string) string {
-	h.t.Helper()
+func (h *harness) runOutput(t *testing.T, dir, name string, args ...string) string {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		h.t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, output)
+		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, output)
 	}
 	return string(output)
 }
