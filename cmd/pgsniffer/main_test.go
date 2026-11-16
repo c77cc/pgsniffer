@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +17,15 @@ import (
 	"github.com/gopacket/gopacket/pcapgo"
 	"github.com/gopacket/gopacket/reassembly"
 )
+
+func TestBuildVersionUsesReleaseVersion(t *testing.T) {
+	previous := releaseVersion
+	releaseVersion = "v0.0.1"
+	t.Cleanup(func() { releaseVersion = previous })
+	if got := buildVersion(); !strings.HasPrefix(got, "pgsniffer v0.0.1") {
+		t.Fatalf("buildVersion() = %q", got)
+	}
+}
 
 func TestRunCaptureOfflinePCAP(t *testing.T) {
 	pcapPath := filepath.Join(t.TempDir(), "postgres.pcap")

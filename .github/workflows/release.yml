@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux_amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - asset: linux_arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - asset: windows_amd64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.11
+          cache: true
+
+      - name: Install libpcap
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Test
+        if: runner.os == 'Linux'
+        run: go test ./...
+
+      - name: Build Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          package="pgsniffer_${VERSION}_${{ matrix.asset }}"
+          mkdir -p "dist/${package}"
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X main.releaseVersion=${VERSION}" \
+            -o "dist/${package}/pgsniffer" ./cmd/pgsniffer
+          "dist/${package}/pgsniffer" --version | grep -F "pgsniffer ${VERSION}"
+          cp README.md README_CN.md LICENSE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          (cd dist && sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256")
+
+      - name: Build Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          $package = "pgsniffer_${env:VERSION}_${{ matrix.asset }}"
+          $packageDir = "dist/$package"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "${{ matrix.goos }}"
+          $env:GOARCH = "${{ matrix.goarch }}"
+          $ldflags = "-s -w -X main.releaseVersion=$env:VERSION"
+          go build -trimpath -ldflags $ldflags -o "$packageDir/pgsniffer.exe" ./cmd/pgsniffer
+          $actual = & "$packageDir/pgsniffer.exe" --version
+          if (-not $actual.StartsWith("pgsniffer $env:VERSION")) {
+            throw "unexpected version: $actual"
+          }
+          Copy-Item README.md, README_CN.md, LICENSE -Destination $packageDir
+          $archive = "dist/$package.zip"
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Upload release package
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.asset }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download release packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --verify-tag \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

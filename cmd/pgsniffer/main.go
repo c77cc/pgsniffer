@@ -26,6 +26,8 @@ import (
 
 const maxQueryKeys = 10000
 
+var releaseVersion string
+
 type config struct {
 	interfaceName string
 	server        string
@@ -353,22 +355,24 @@ func printAllDevices(w io.Writer) error {
 }
 
 func buildVersion() string {
+	version := releaseVersion
+	var revision string
 	if info, ok := debug.ReadBuildInfo(); ok {
-		version := info.Main.Version
-		if version == "" || version == "(devel)" {
-			version = "devel"
+		if version == "" {
+			version = info.Main.Version
 		}
-		var revision string
 		for _, setting := range info.Settings {
 			if setting.Key == "vcs.revision" {
 				revision = setting.Value
 				break
 			}
 		}
-		if revision != "" {
-			return strings.Join([]string{"pgsniffer", version, revision[:min(12, len(revision))]}, " ")
-		}
-		return "pgsniffer " + version
 	}
-	return "pgsniffer devel"
+	if version == "" || version == "(devel)" {
+		version = "devel"
+	}
+	if revision != "" {
+		return strings.Join([]string{"pgsniffer", version, revision[:min(12, len(revision))]}, " ")
+	}
+	return "pgsniffer " + version
 }
