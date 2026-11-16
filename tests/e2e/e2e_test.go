@@ -200,7 +200,7 @@ func (h *harness) build() {
 		h.run(h.t, h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.binary)
 		h.run(h.t, h.repo, "sudo", "-n", "setcap", "cap_net_raw,cap_net_admin=eip", h.tcpdump)
 	}
-	list := h.runOutput(h.t, h.repo, h.binary, "-l")
+	list := h.runOutput(h.t, h.repo, h.binary, "--list-interfaces")
 	if !strings.Contains(list, h.iface) {
 		h.t.Fatalf("capture interface %q not found in:\n%s", h.iface, list)
 	}
@@ -501,7 +501,7 @@ func (h *harness) startCapture(t *testing.T, label string, port int) *capture {
 	cap.packetDone = make(chan error, 1)
 	go func() { cap.packetDone <- cap.packetCmd.Wait() }()
 
-	args := []string{h.binary, "-i", h.iface, "--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "-n", "0"}
+	args := []string{h.binary, "--interface", h.iface, "--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "--max-groups", "0"}
 	if os.Getenv("PGSNIFFER_E2E_SUDO") == "1" {
 		args = append([]string{"sudo", "-n"}, args...)
 	}
@@ -594,7 +594,7 @@ func (h *harness) replay(t *testing.T, pcapPath string, port int, name string) r
 	t.Helper()
 	path := filepath.Join(h.artifacts, name)
 	data := []byte(h.runOutput(t, h.repo, h.binary, "--read-pcap", pcapPath,
-		"--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "-n", "0"))
+		"--server", net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), "--max-groups", "0"))
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("retain replay report: %v", err)
 	}

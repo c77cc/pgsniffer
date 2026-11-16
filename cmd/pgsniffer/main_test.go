@@ -159,7 +159,7 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestParseFlags(t *testing.T) {
-	cfg, err := parseFlags([]string{"-i", "lo", "--server", "127.0.0.1:55432", "-n", "0", "--log-queries", "--group-by", "raw-sql", "--listen", "127.0.0.1:9108", "--report-interval", "1m", "--report-file", "reports.jsonl"})
+	cfg, err := parseFlags([]string{"--interface", "lo", "--server", "127.0.0.1:55432", "--max-groups", "0", "--log-queries", "--group-by", "raw-sql", "--listen", "127.0.0.1:9108", "--report-interval", "1m", "--report-file", "reports.jsonl"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,6 +178,11 @@ func TestParseFlags(t *testing.T) {
 	if _, err := parseFlagsWithOutput([]string{"--raw-sql"}, io.Discard); err == nil {
 		t.Fatal("removed --raw-sql flag should be rejected")
 	}
+	for _, removed := range []string{"-i", "-l", "-n"} {
+		if _, err := parseFlagsWithOutput([]string{removed}, io.Discard); err == nil {
+			t.Errorf("removed %s flag should be rejected", removed)
+		}
+	}
 }
 
 func TestCustomHelp(t *testing.T) {
@@ -193,8 +198,11 @@ func TestCustomHelp(t *testing.T) {
 		"Observability options:",
 		"Other options:",
 		"--server IP:PORT",
+		"--interface INTERFACE",
+		"--list-interfaces",
 		"--group-by MODE",
 		"--log-queries",
+		"--max-groups COUNT",
 		"-h, --help",
 		"requires --report-interval",
 	} {

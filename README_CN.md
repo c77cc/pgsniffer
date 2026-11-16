@@ -33,13 +33,13 @@ Linux 安装包使用 `AF_PACKET`/`TPACKET_V3` 共享内存环形缓冲，不依
 列出抓包网卡：
 
 ```bash
-./pgsniffer -l
+./pgsniffer --list-interfaces
 ```
 
 持续抓取 PostgreSQL 服务端流量，按 `Ctrl-C` 后输出 JSON 报告：
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 > report.json
 ```
 
 分析已有 PCAP：
@@ -54,30 +54,47 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
 
 ```bash
 # 在终端逐条实时输出原始 SQL。
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --log-queries
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --log-queries
 
 # 最终报告按原始 SQL 分组，不使用指纹。
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --group-by raw-sql
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --group-by raw-sql
 ```
+
+## 命令行参数
+
+| 参数 | 说明 |
+| --- | --- |
+| `--server IP:PORT` | PostgreSQL 服务端地址。实时抓包和 PCAP 回放时必填；IPv6 地址必须使用方括号。 |
+| `--interface INTERFACE` | 实时抓包使用的网卡，默认值因平台而异。 |
+| `--list-interfaces` | 列出可用抓包网卡并退出。 |
+| `--read-pcap FILE` | 分析 PCAP/PCAPNG 文件，不进行实时抓包。 |
+| `--group-by MODE` | 按 `fingerprint` 或 `raw-sql` 聚合报告（默认：`fingerprint`）；原始 SQL 可能暴露敏感值。 |
+| `--log-queries` | 将每条已完成查询的原始 SQL 输出到 stderr，可能暴露敏感值。 |
+| `--max-groups COUNT` | 按最大耗时排序后最多输出的 SQL 分组数（默认：`50`；`0` 表示全部）。 |
+| `--listen ADDRESS` | 提供 `/healthz`、`/report` 和 `/metrics`，例如 `127.0.0.1:9108`。 |
+| `--report-interval DURATION` | 周期性 JSONL 报告的时间间隔，例如 `1m`；必须同时设置 `--report-file`。 |
+| `--report-file FILE` | 追加写入周期性 JSONL 报告；必须同时设置 `--report-interval`。 |
+| `--version` | 输出版本号并退出。 |
+| `-h`、`--help` | 显示命令行帮助并退出。 |
 
 ## 长期运行与实时观测
 
 启用只监听本机的 HTTP 接口：
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
 ```
 
 可用端点：
 
 - `GET /healthz`：存活检查。
-- `GET /report`：当前累计 JSON 报告，遵循 `-n` 限制。
+- `GET /report`：当前累计 JSON 报告，遵循 `--max-groups` 限制。
 - `GET /metrics`：Prometheus 文本指标，包含全部有界 SQL 聚合。
 
 周期性追加 JSONL 快照：
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
   --listen 127.0.0.1:9108 \
   --report-interval 1m \
   --report-file /var/log/pgsniffer/reports.jsonl

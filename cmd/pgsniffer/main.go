@@ -235,12 +235,12 @@ func parseFlagsWithOutput(args []string, output io.Writer) (config, error) {
 	flags.Usage = func() {
 		_, _ = fmt.Fprint(flags.Output(), usageText(defaultCaptureInterface()))
 	}
-	flags.StringVar(&cfg.interfaceName, "i", defaultCaptureInterface(), "network interface to capture")
+	flags.StringVar(&cfg.interfaceName, "interface", defaultCaptureInterface(), "network interface to capture")
 	flags.StringVar(&cfg.server, "server", "", "PostgreSQL server endpoint as IP:PORT (required)")
-	flags.IntVar(&cfg.topN, "n", 50, "number of SQL groups to report (0 means all)")
+	flags.IntVar(&cfg.topN, "max-groups", 50, "maximum number of SQL groups to report (0 means all)")
 	flags.BoolVar(&cfg.logQueries, "log-queries", false, "log every completed query with raw SQL (sensitive)")
 	flags.StringVar(&cfg.groupBy, "group-by", groupByFingerprint, "report grouping: fingerprint or raw-sql")
-	flags.BoolVar(&cfg.listDevices, "l", false, "list capture interfaces and exit")
+	flags.BoolVar(&cfg.listDevices, "list-interfaces", false, "list capture interfaces and exit")
 	flags.StringVar(&cfg.readPCAP, "read-pcap", "", "read packets from a PCAP file instead of an interface")
 	flags.StringVar(&cfg.listen, "listen", "", "HTTP address for /healthz, /report, and /metrics")
 	flags.DurationVar(&cfg.reportInterval, "report-interval", 0, "periodic JSONL report interval (requires --report-file)")
@@ -266,9 +266,9 @@ func usageText(defaultInterface string) string {
 Capture options:
   --server IP:PORT
         PostgreSQL server endpoint; required for capture and replay
-  -i INTERFACE
+  --interface INTERFACE
         Network interface for live capture%s
-  -l
+  --list-interfaces
         List capture interfaces and exit
   --read-pcap FILE
         Analyze a PCAP/PCAPNG file instead of live capture
@@ -279,8 +279,8 @@ SQL output options:
   --log-queries
         Log every completed original SQL query to stderr
         Warning: may expose sensitive values
-  -n COUNT
-        Number of SQL groups ordered by maximum latency;
+  --max-groups COUNT
+        Maximum number of SQL groups ordered by maximum latency;
         0 reports all groups (default: 50)
 
 Observability options:
@@ -305,7 +305,7 @@ func validateConfig(cfg config) error {
 		return err
 	}
 	if cfg.topN < 0 {
-		return fmt.Errorf("top N cannot be negative")
+		return fmt.Errorf("--max-groups cannot be negative")
 	}
 	if cfg.groupBy != groupByFingerprint && cfg.groupBy != groupByRawSQL {
 		return fmt.Errorf("invalid --group-by %q: expected fingerprint or raw-sql", cfg.groupBy)
@@ -320,7 +320,7 @@ func validateConfig(cfg config) error {
 		return fmt.Errorf("--report-interval is required with --report-file")
 	}
 	if cfg.readPCAP == "" && cfg.interfaceName == "" {
-		return fmt.Errorf("-i is required for live capture on this platform; use -l to list interfaces")
+		return fmt.Errorf("--interface is required for live capture on this platform; use --list-interfaces to list interfaces")
 	}
 	return nil
 }

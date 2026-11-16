@@ -33,13 +33,13 @@ Linux packages are self-contained and use an `AF_PACKET`/`TPACKET_V3` shared-mem
 List capture interfaces:
 
 ```bash
-./pgsniffer -l
+./pgsniffer --list-interfaces
 ```
 
 Capture a PostgreSQL server until `Ctrl-C`, then print the JSON report:
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 > report.json
 ```
 
 Analyze an existing PCAP:
@@ -54,30 +54,47 @@ Raw SQL values are discarded from reports by default. `--log-queries` logs every
 
 ```bash
 # Stream every original SQL statement to the terminal.
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --log-queries
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --log-queries
 
 # Group the final report by original SQL instead of fingerprints.
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --group-by raw-sql
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --group-by raw-sql
 ```
+
+## Command-line options
+
+| Option | Description |
+| --- | --- |
+| `--server IP:PORT` | PostgreSQL server endpoint. Required for live capture and PCAP replay; IPv6 addresses must use brackets. |
+| `--interface INTERFACE` | Network interface for live capture. The default is platform-specific. |
+| `--list-interfaces` | List available capture interfaces and exit. |
+| `--read-pcap FILE` | Analyze a PCAP/PCAPNG file instead of capturing live traffic. |
+| `--group-by MODE` | Group reports by `fingerprint` or `raw-sql` (default: `fingerprint`). Raw SQL may expose sensitive values. |
+| `--log-queries` | Log every completed original SQL query to stderr. This may expose sensitive values. |
+| `--max-groups COUNT` | Maximum number of SQL groups, ordered by maximum latency (default: `50`; `0` reports all groups). |
+| `--listen ADDRESS` | Serve `/healthz`, `/report`, and `/metrics`, for example `127.0.0.1:9108`. |
+| `--report-interval DURATION` | Periodic JSONL report interval, for example `1m`; requires `--report-file`. |
+| `--report-file FILE` | Append periodic JSONL reports to a file; requires `--report-interval`. |
+| `--version` | Print the version and exit. |
+| `-h`, `--help` | Show command-line help and exit. |
 
 ## Long-running observability
 
 Enable an HTTP endpoint bound to localhost:
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
 ```
 
 The endpoints are:
 
 - `GET /healthz` for liveness checks.
-- `GET /report` for the current cumulative JSON report, limited by `-n`.
+- `GET /report` for the current cumulative JSON report, limited by `--max-groups`.
 - `GET /metrics` for Prometheus text metrics across all bounded SQL groups.
 
 Append periodic JSONL snapshots with:
 
 ```bash
-sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
+sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
   --listen 127.0.0.1:9108 \
   --report-interval 1m \
   --report-file /var/log/pgsniffer/reports.jsonl
