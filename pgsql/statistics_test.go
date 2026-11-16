@@ -35,7 +35,7 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	collector.Add(Event{Query: "SELECT 2", Duration: 2 * time.Millisecond})
 	collector.Add(Event{Query: "SELECT pg_sleep(1)", Duration: time.Second})
 	report := collector.Snapshot("max", 1)
-	if len(report.Queries) != 1 || !strings.Contains(report.Queries[0].Fingerprint, "pg_sleep") {
+	if len(report.Queries) != 1 || !strings.Contains(report.Queries[0].Query, "pg_sleep") || report.Queries[0].Fingerprint != "" {
 		t.Fatalf("report = %+v", report)
 	}
 
@@ -51,7 +51,7 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if err := WriteJSON(&encoded, report); err != nil {
 		t.Fatal(err)
 	}
-	if output := encoded.String(); !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
+	if output := encoded.String(); !strings.Contains(output, `"query": "SELECT pg_sleep(1)"`) || strings.Contains(output, `"fingerprint"`) || !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
 		t.Fatalf("unexpected JSON schema: %s", output)
 	}
 	var decoded Report
@@ -89,15 +89,36 @@ func TestJSONDurationUsesReadableMilliseconds(t *testing.T) {
 	}
 }
 
-func TestCollectorTruncatesVeryLongFingerprints(t *testing.T) {
+func TestCollectorRawSQLUsesExactQueriesAndBoundsLength(t *testing.T) {
 	collector := NewCollector(10, true)
-	collector.Add(Event{Query: "SELECT '" + strings.Repeat("x", maxFingerprintInput*2) + "'", Duration: time.Millisecond})
+	collector.Add(Event{Query: "SELECT 1", Duration: time.Millisecond})
+	collector.Add(Event{Query: "SELECT 2", Duration: time.Millisecond})
+	collector.Add(Event{Query: "SELECT '" + strings.Repeat("x", maxSQLInput*2) + "'", Duration: time.Millisecond})
 	report := collector.Snapshot("max", 0)
-	if len(report.Queries) != 1 {
+	if len(report.Queries) != 3 {
 		t.Fatalf("report = %+v", report)
 	}
-	if len(report.Queries[0].Fingerprint) > maxFingerprintInput+100 || len(report.Queries[0].Example) > maxFingerprintInput+100 {
-		t.Fatalf("long query was not bounded: fingerprint=%d example=%d", len(report.Queries[0].Fingerprint), len(report.Queries[0].Example))
+	for _, summary := range report.Queries {
+		if summary.Fingerprint != "" || summary.Query == "" || len(summary.Query) > maxSQLInput+100 {
+			t.Fatalf("raw SQL summary = %+v", summary)
+		}
+	}
+}
+
+func TestCollectorFingerprintModeOmitsRawSQL(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.Add(Event{Query: "SELECT * FROM users WHERE token = 'super-secret-1'", Duration: time.Millisecond})
+	collector.Add(Event{Query: "SELECT * FROM users WHERE token = 'super-secret-2'", Duration: time.Millisecond})
+	report := collector.Snapshot("max", 0)
+	if len(report.Queries) != 1 || report.Queries[0].Fingerprint == "" || report.Queries[0].Query != "" || report.Queries[0].Count != 2 {
+		t.Fatalf("report = %+v", report)
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "super-secret") || strings.Contains(string(data), `"query"`) {
+		t.Fatalf("raw SQL leaked in fingerprint mode: %s", data)
 	}
 }
 

@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
+	"flag"
+	"io"
+	"log"
 	"net"
 	"net/netip"
 	"os"
@@ -109,7 +113,7 @@ func TestOpenOfflinePCAPNG(t *testing.T) {
 }
 
 func TestValidateConfig(t *testing.T) {
-	valid := config{interfaceName: "lo", server: "127.0.0.1:5432", topN: 10}
+	valid := config{interfaceName: "lo", server: "127.0.0.1:5432", topN: 10, groupBy: groupByFingerprint}
 	if err := validateConfig(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -141,6 +145,11 @@ func TestValidateConfig(t *testing.T) {
 	if err := validateConfig(invalid); err == nil {
 		t.Fatal("expected report interval validation error")
 	}
+	invalid = valid
+	invalid.groupBy = "query"
+	if err := validateConfig(invalid); err == nil {
+		t.Fatal("expected group-by validation error")
+	}
 	if got := serverBPFFilter(mustServerEndpoint(t, "127.0.0.1:55432")); got != "host 127.0.0.1 and tcp port 55432" {
 		t.Fatalf("IPv4 filter = %q", got)
 	}
@@ -150,15 +159,68 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestParseFlags(t *testing.T) {
-	cfg, err := parseFlags([]string{"-i", "lo", "--server", "127.0.0.1:55432", "-n", "0", "-v", "--listen", "127.0.0.1:9108", "--report-interval", "1m", "--report-file", "reports.jsonl"})
+	cfg, err := parseFlags([]string{"-i", "lo", "--server", "127.0.0.1:55432", "-n", "0", "--log-queries", "--group-by", "raw-sql", "--listen", "127.0.0.1:9108", "--report-interval", "1m", "--report-file", "reports.jsonl"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.interfaceName != "lo" || cfg.server != "127.0.0.1:55432" || cfg.topN != 0 || !cfg.verbose || cfg.listen != "127.0.0.1:9108" || cfg.reportInterval != time.Minute || cfg.reportFile != "reports.jsonl" {
+	if cfg.interfaceName != "lo" || cfg.server != "127.0.0.1:55432" || cfg.topN != 0 || !cfg.logQueries || cfg.groupBy != groupByRawSQL || cfg.listen != "127.0.0.1:9108" || cfg.reportInterval != time.Minute || cfg.reportFile != "reports.jsonl" {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if _, err := parseFlags([]string{"unexpected"}); err == nil {
 		t.Fatal("expected positional argument error")
+	}
+	if _, err := parseFlagsWithOutput([]string{"--show-query-values"}, io.Discard); err == nil {
+		t.Fatal("removed --show-query-values flag should be rejected")
+	}
+	if _, err := parseFlagsWithOutput([]string{"-v"}, io.Discard); err == nil {
+		t.Fatal("removed -v flag should be rejected")
+	}
+	if _, err := parseFlagsWithOutput([]string{"--raw-sql"}, io.Discard); err == nil {
+		t.Fatal("removed --raw-sql flag should be rejected")
+	}
+}
+
+func TestCustomHelp(t *testing.T) {
+	var output bytes.Buffer
+	if _, err := parseFlagsWithOutput([]string{"--help"}, &output); err != flag.ErrHelp {
+		t.Fatalf("--help error = %v, want flag.ErrHelp", err)
+	}
+	help := output.String()
+	for _, expected := range []string{
+		"Usage:\n  pgsniffer [options]",
+		"Capture options:",
+		"SQL output options:",
+		"Observability options:",
+		"Other options:",
+		"--server IP:PORT",
+		"--group-by MODE",
+		"--log-queries",
+		"-h, --help",
+		"requires --report-interval",
+	} {
+		if !strings.Contains(help, expected) {
+			t.Errorf("help is missing %q:\n%s", expected, help)
+		}
+	}
+	if strings.Contains(help, "Usage of pgsniffer") || strings.Contains(help, "-group-by string") {
+		t.Fatalf("help contains Go flag defaults:\n%s", help)
+	}
+}
+
+func TestQueryLogUsesRawSQL(t *testing.T) {
+	var output bytes.Buffer
+	previousOutput := log.Writer()
+	previousFlags := log.Flags()
+	log.SetOutput(&output)
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(previousOutput)
+		log.SetFlags(previousFlags)
+	})
+
+	logCompletedQuery(pgsql.Event{Query: "SELECT * FROM users WHERE id = 123", Duration: 2 * time.Millisecond})
+	if got := output.String(); !strings.Contains(got, `sql="SELECT * FROM users WHERE id = 123"`) || strings.Contains(got, "id = ?") {
+		t.Fatalf("query log = %q", got)
 	}
 }
 

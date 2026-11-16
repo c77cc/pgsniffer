@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -24,14 +25,19 @@ import (
 
 const maxQueryKeys = 10000
 
+const (
+	groupByFingerprint = "fingerprint"
+	groupByRawSQL      = "raw-sql"
+)
+
 var releaseVersion string
 
 type config struct {
 	interfaceName  string
 	server         string
 	topN           int
-	verbose        bool
-	showValues     bool
+	logQueries     bool
+	groupBy        string
 	listDevices    bool
 	readPCAP       string
 	listen         string
@@ -50,16 +56,14 @@ type pgStreamFactory struct {
 	serverIP   string
 	serverPort layers.TCPPort
 	collector  *pgsql.Collector
-	verbose    bool
-	showValues bool
+	logQueries bool
 }
 
 type pgStream struct {
 	session       *pgsql.Session
 	collector     *pgsql.Collector
 	firstIsClient bool
-	verbose       bool
-	showValues    bool
+	logQueries    bool
 	lastSeen      time.Time
 	sawTCPClose   bool
 	sawMidstream  bool
@@ -86,28 +90,28 @@ func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reass
 
 	stream := &pgStream{
 		collector: f.collector, firstIsClient: firstIsClient,
-		verbose: f.verbose, showValues: f.showValues,
+		logQueries: f.logQueries,
 	}
 	stream.session = pgsql.NewSession(pgsql.DefaultMaxFrameSize, metadata, func(event pgsql.Event) {
 		f.collector.Add(event)
-		if !f.verbose {
+		if !f.logQueries {
 			return
 		}
-		if event.Encrypted {
-			log.Printf("encrypted PostgreSQL session client=%s", event.Metadata.Client)
-			return
-		}
-		query := pgsql.Fingerprint(event.Query)
-		if f.showValues {
-			query = event.Query
-		}
-		if event.ErrorCode != "" {
-			log.Printf("query duration=%s sqlstate=%s sql=%q", event.Duration, event.ErrorCode, query)
-		} else {
-			log.Printf("query duration=%s sql=%q", event.Duration, query)
-		}
+		logCompletedQuery(event)
 	})
 	return stream
+}
+
+func logCompletedQuery(event pgsql.Event) {
+	if event.Encrypted {
+		log.Printf("encrypted PostgreSQL session client=%s", event.Metadata.Client)
+		return
+	}
+	if event.ErrorCode != "" {
+		log.Printf("query duration=%s sqlstate=%s sql=%q", event.Duration, event.ErrorCode, event.Query)
+	} else {
+		log.Printf("query duration=%s sql=%q", event.Duration, event.Query)
+	}
 }
 
 func (s *pgStream) Accept(tcp *layers.TCP, info gopacket.CaptureInfo, _ reassembly.TCPFlowDirection, _ reassembly.Sequence, start *bool, _ reassembly.AssemblerContext) bool {
@@ -156,7 +160,7 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	if err := s.session.Feed(pgDirection, data, info.Timestamp); err != nil {
 		s.collector.AddDecodeError()
 		s.session.Abort(info.Timestamp)
-		if s.verbose {
+		if s.logQueries {
 			log.Printf("discarding malformed PostgreSQL stream data: %v", err)
 		}
 	}
@@ -209,7 +213,7 @@ func runMain() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	collector := pgsql.NewCollector(maxQueryKeys, cfg.showValues)
+	collector := pgsql.NewCollector(maxQueryKeys, cfg.groupBy == groupByRawSQL)
 	captureErr := runCaptureWithServices(ctx, cfg, collector)
 	if err := pgsql.WriteJSON(os.Stdout, collector.Snapshot("max", cfg.topN)); err != nil {
 		return err
@@ -221,13 +225,21 @@ func runMain() error {
 }
 
 func parseFlags(args []string) (config, error) {
+	return parseFlagsWithOutput(args, os.Stderr)
+}
+
+func parseFlagsWithOutput(args []string, output io.Writer) (config, error) {
 	var cfg config
 	flags := flag.NewFlagSet("pgsniffer", flag.ContinueOnError)
+	flags.SetOutput(output)
+	flags.Usage = func() {
+		_, _ = fmt.Fprint(flags.Output(), usageText(defaultCaptureInterface()))
+	}
 	flags.StringVar(&cfg.interfaceName, "i", defaultCaptureInterface(), "network interface to capture")
 	flags.StringVar(&cfg.server, "server", "", "PostgreSQL server endpoint as IP:PORT (required)")
-	flags.IntVar(&cfg.topN, "n", 50, "number of query fingerprints to report (0 means all)")
-	flags.BoolVar(&cfg.verbose, "v", false, "log every completed query")
-	flags.BoolVar(&cfg.showValues, "show-query-values", false, "show and retain raw query values (sensitive)")
+	flags.IntVar(&cfg.topN, "n", 50, "number of SQL groups to report (0 means all)")
+	flags.BoolVar(&cfg.logQueries, "log-queries", false, "log every completed query with raw SQL (sensitive)")
+	flags.StringVar(&cfg.groupBy, "group-by", groupByFingerprint, "report grouping: fingerprint or raw-sql")
 	flags.BoolVar(&cfg.listDevices, "l", false, "list capture interfaces and exit")
 	flags.StringVar(&cfg.readPCAP, "read-pcap", "", "read packets from a PCAP file instead of an interface")
 	flags.StringVar(&cfg.listen, "listen", "", "HTTP address for /healthz, /report, and /metrics")
@@ -243,12 +255,60 @@ func parseFlags(args []string) (config, error) {
 	return cfg, nil
 }
 
+func usageText(defaultInterface string) string {
+	interfaceDefault := ""
+	if defaultInterface != "" {
+		interfaceDefault = fmt.Sprintf(" (default: %s)", defaultInterface)
+	}
+	return fmt.Sprintf(`Usage:
+  pgsniffer [options]
+
+Capture options:
+  --server IP:PORT
+        PostgreSQL server endpoint; required for capture and replay
+  -i INTERFACE
+        Network interface for live capture%s
+  -l
+        List capture interfaces and exit
+  --read-pcap FILE
+        Analyze a PCAP/PCAPNG file instead of live capture
+
+SQL output options:
+  --group-by MODE
+        Report grouping mode: fingerprint or raw-sql (default: fingerprint)
+  --log-queries
+        Log every completed original SQL query to stderr
+        Warning: may expose sensitive values
+  -n COUNT
+        Number of SQL groups ordered by maximum latency;
+        0 reports all groups (default: 50)
+
+Observability options:
+  --listen ADDRESS
+        Serve /healthz, /report, and /metrics
+        Example: 127.0.0.1:9108
+  --report-interval DURATION
+        Periodic JSONL report interval; requires --report-file
+  --report-file FILE
+        Append periodic JSONL reports; requires --report-interval
+
+Other options:
+  --version
+        Print version and exit
+  -h, --help
+        Show this help
+`, interfaceDefault)
+}
+
 func validateConfig(cfg config) error {
 	if _, err := parseServerEndpoint(cfg.server); err != nil {
 		return err
 	}
 	if cfg.topN < 0 {
 		return fmt.Errorf("top N cannot be negative")
+	}
+	if cfg.groupBy != groupByFingerprint && cfg.groupBy != groupByRawSQL {
+		return fmt.Errorf("invalid --group-by %q: expected fingerprint or raw-sql", cfg.groupBy)
 	}
 	if cfg.reportInterval < 0 {
 		return fmt.Errorf("--report-interval cannot be negative")
@@ -304,7 +364,7 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 
 	factory := &pgStreamFactory{
 		serverIP: server.Addr().String(), serverPort: layers.TCPPort(server.Port()), collector: collector,
-		verbose: cfg.verbose, showValues: cfg.showValues,
+		logQueries: cfg.logQueries,
 	}
 	pool := reassembly.NewStreamPool(factory)
 	assembler := reassembly.NewAssembler(pool)

@@ -50,7 +50,15 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
 
 `--server` 为必填参数，格式是 IP 字面量加端口。IPv6 需要使用方括号，例如 `--server '[::1]:5432'`。执行 `./pgsniffer -h` 可查看全部参数。
 
-程序默认丢弃原始 SQL 值。`--show-query-values` 会保留这些值，可能暴露敏感数据；`-v` 可在抓包期间记录已完成的查询。
+报告默认丢弃原始 SQL 值。`--log-queries` 会在抓包期间把每条已完成查询的原始 SQL 实时输出到 stderr；`--group-by raw-sql` 会关闭指纹聚合，改为按完整原始 SQL 分组和输出。这两个选项都可能暴露敏感值。报告默认采用 `--group-by fingerprint`。
+
+```bash
+# 在终端逐条实时输出原始 SQL。
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --log-queries
+
+# 最终报告按原始 SQL 分组，不使用指纹。
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --group-by raw-sql
+```
 
 ## 长期运行与实时观测
 
@@ -64,7 +72,7 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
 
 - `GET /healthz`：存活检查。
 - `GET /report`：当前累计 JSON 报告，遵循 `-n` 限制。
-- `GET /metrics`：Prometheus 文本指标，包含全部有界 SQL 指纹聚合。
+- `GET /metrics`：Prometheus 文本指标，包含全部有界 SQL 聚合。
 
 周期性追加 JSONL 快照：
 
@@ -75,7 +83,7 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
   --report-file /var/log/pgsniffer/reports.jsonl
 ```
 
-报告文件使用仅当前用户可读写的权限创建。HTTP 没有内置认证，报告和指标可能包含数据库、用户、客户端地址及 SQL 指纹；除非前面有受信任的认证代理，否则不要监听公网地址。
+报告文件使用仅当前用户可读写的权限创建。HTTP 没有内置认证，报告和指标可能包含数据库、用户、客户端地址、SQL 指纹；启用 `--group-by raw-sql` 后还会包含原始 SQL。除非前面有受信任的认证代理，否则不要监听公网地址。
 
 ## 输出
 
@@ -128,7 +136,19 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
 }
 ```
 
-`incomplete` 表示没有获得完整响应的请求数量。`incomplete_reasons` 会区分连接关闭、抓包结束或空闲超时、TCP 缺口、协议错误，以及流水线出错后被跳过的请求。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。`dropped_query_keys` 表示达到有界聚合上限后被合并的新“SQL 指纹与维度”组合数量。
+`incomplete` 表示没有获得完整响应的请求数量。`incomplete_reasons` 会区分连接关闭、抓包结束或空闲超时、TCP 缺口、协议错误，以及流水线出错后被跳过的请求。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。`dropped_query_keys` 表示达到有界聚合上限后被合并的新“SQL 与维度”组合数量。
+
+启用 `--group-by raw-sql` 后，每条记录按完整原始 SQL 分组，并使用 `query` 字段替代 `fingerprint`：
+
+```json
+{
+  "query": "SELECT * FROM users WHERE id = 123",
+  "calls": 1
+}
+```
+
+这种模式下，仅字面量值不同的 SQL 也会成为不同分组。
+对于 Extended Query 协议，PostgreSQL 会分别传输 SQL 文本和绑定值；`--log-queries` 与 `--group-by raw-sql` 展示的是包含 `$1` 等占位符的原始 SQL 文本，不会拼接生成一条新的 SQL。
 
 ## 耗时语义
 

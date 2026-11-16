@@ -19,6 +19,7 @@ const (
 	DefaultMaxFrameSize = 16 << 20
 	maxPreparedObjects  = 4096
 	maxPendingRequests  = 4096
+	maxFrontendOps      = maxPendingRequests * 8
 )
 
 var (
@@ -77,6 +78,7 @@ type portal struct {
 }
 
 type pendingRequest struct {
+	id                uint64
 	query             string
 	startedAt         time.Time
 	metadata          Metadata
@@ -87,6 +89,33 @@ type pendingRequest struct {
 	errorCode         string
 	errorInfo         string
 	severity          string
+}
+
+type operationKind byte
+
+const (
+	operationParse operationKind = iota
+	operationBind
+	operationDescribe
+	operationExecute
+	operationClose
+)
+
+type frontendOperation struct {
+	kind              operationKind
+	query             string
+	startedAt         time.Time
+	metadata          Metadata
+	transactionStatus string
+	syncGroup         uint64
+	requestID         uint64
+	objectType        byte
+	objectName        string
+	mutated           bool
+	previousQuery     string
+	previousFound     bool
+	previousPortal    portal
+	previousPortalSet bool
 }
 
 // Session incrementally decodes both halves of one PostgreSQL TCP connection.
@@ -109,6 +138,8 @@ type Session struct {
 	statements        map[string]string
 	portals           map[string]portal
 	pending           []pendingRequest
+	operations        []frontendOperation
+	nextRequestID     uint64
 	transactionStatus string
 	frontendSyncGroup uint64
 	backendSyncGroup  uint64
@@ -311,10 +342,24 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 			return
 		}
 		query, _, ok := readCString(rest)
-		if ok && query != "" {
-			if _, found := s.statements[name]; found || len(s.statements) < maxPreparedObjects {
-				s.statements[name] = query
+		if ok {
+			previousQuery, previousFound := s.statements[name]
+			previousPortal, previousPortalSet := s.portals[""]
+			// PostgreSQL closes the unnamed portal when the unnamed
+			// statement is replaced, even before a new Bind arrives.
+			if name == "" {
+				delete(s.portals, "")
 			}
+			mutated := false
+			if previousFound || len(s.statements) < maxPreparedObjects {
+				s.statements[name] = query
+				mutated = true
+			}
+			s.appendOperation(frontendOperation{
+				kind: operationParse, query: query, objectName: name, mutated: mutated,
+				previousQuery: previousQuery, previousFound: previousFound,
+				previousPortal: previousPortal, previousPortalSet: previousPortalSet,
+			}, at)
 		}
 	case 'B':
 		portalName, rest, ok := readCString(payload)
@@ -325,22 +370,52 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 		if !ok {
 			return
 		}
-		if query, found := s.statements[statementName]; found {
-			if _, exists := s.portals[portalName]; exists || len(s.portals) < maxPreparedObjects {
-				s.portals[portalName] = portal{query: query}
-			}
+		query, statementFound := s.statements[statementName]
+		previousPortal, previousFound := s.portals[portalName]
+		mutated := false
+		if statementFound && (previousFound || len(s.portals) < maxPreparedObjects) {
+			s.portals[portalName] = portal{query: query}
+			mutated = true
 		}
+		s.appendOperation(frontendOperation{
+			kind: operationBind, query: query, objectName: portalName, mutated: mutated,
+			previousQuery: previousPortal.query, previousFound: previousFound,
+		}, at)
+	case 'D':
+		if len(payload) < 2 {
+			return
+		}
+		name, _, ok := readCString(payload[1:])
+		if !ok {
+			return
+		}
+		var query string
+		switch payload[0] {
+		case 'S':
+			query = s.statements[name]
+		case 'P':
+			query = s.portals[name].query
+		default:
+			return
+		}
+		s.appendOperation(frontendOperation{kind: operationDescribe, query: query}, at)
 	case 'E':
 		portalName, _, ok := readCString(payload)
 		if !ok {
 			return
 		}
+		var requestID uint64
 		if bound, found := s.portals[portalName]; found && bound.query != "" {
-			s.appendPending(pendingRequest{
+			requestID = s.appendPending(pendingRequest{
 				query: bound.query, startedAt: at, metadata: s.metadata,
 				transactionStatus: s.transactionStatus, syncGroup: s.frontendSyncGroup,
 			})
 		}
+		query := ""
+		if bound, found := s.portals[portalName]; found {
+			query = bound.query
+		}
+		s.appendOperation(frontendOperation{kind: operationExecute, query: query, requestID: requestID}, at)
 	case 'S':
 		s.frontendSyncGroup++
 	case 'C':
@@ -351,21 +426,51 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 		if !ok {
 			return
 		}
+		var query string
+		var found bool
 		if payload[0] == 'S' {
+			query, found = s.statements[name]
 			delete(s.statements, name)
 		} else if payload[0] == 'P' {
+			var value portal
+			value, found = s.portals[name]
+			query = value.query
 			delete(s.portals, name)
+		} else {
+			return
 		}
+		s.appendOperation(frontendOperation{
+			kind: operationClose, query: query, objectType: payload[0], objectName: name, mutated: found,
+			previousQuery: query, previousFound: found,
+		}, at)
 	case 'X':
 		s.finishAll(at, "client_terminated")
 	}
 }
 
-func (s *Session) appendPending(request pendingRequest) {
+func (s *Session) appendPending(request pendingRequest) uint64 {
 	if len(s.pending) >= maxPendingRequests {
 		s.finishFirst(request.startedAt, "", "", "", "pending_limit")
 	}
+	s.nextRequestID++
+	request.id = s.nextRequestID
 	s.pending = append(s.pending, request)
+	return request.id
+}
+
+func (s *Session) appendOperation(operation frontendOperation, at time.Time) {
+	if len(s.operations) >= maxFrontendOps {
+		s.finishAll(at, "operation_limit")
+		for index := len(s.operations) - 1; index >= 0; index-- {
+			s.rollbackOperation(s.operations[index])
+		}
+		s.operations = nil
+	}
+	operation.startedAt = at
+	operation.metadata = s.metadata
+	operation.transactionStatus = s.transactionStatus
+	operation.syncGroup = s.frontendSyncGroup
+	s.operations = append(s.operations, operation)
 }
 
 func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
@@ -386,16 +491,16 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 			s.metadata.User = value
 		}
 	case 'C': // CommandComplete
-		if len(s.pending) > 0 {
+		if len(s.pending) > 0 && s.pending[0].simple {
 			s.pending[0].commands = append(s.pending[0].commands, parseCommand(payload))
-		}
-		if len(s.pending) > 0 && !s.pending[0].simple {
-			s.finishFirst(at, "", "", "", "")
+		} else if operation, ok := s.consumeOperation(operationExecute); ok {
+			s.addCommand(operation.requestID, parseCommand(payload))
+			s.finishRequest(operation.requestID, at, "", "", "", "")
 		}
 	case 's': // PortalSuspended completes this Execute, but not the portal.
-		if len(s.pending) > 0 && !s.pending[0].simple {
-			s.pending[0].commands = append(s.pending[0].commands, Command{Tag: "PORTAL SUSPENDED"})
-			s.finishFirst(at, "", "", "", "")
+		if operation, ok := s.consumeOperation(operationExecute); ok {
+			s.addCommand(operation.requestID, Command{Tag: "PORTAL SUSPENDED"})
+			s.finishRequest(operation.requestID, at, "", "", "", "")
 		}
 	case 'E':
 		code, message, severity := parseError(payload)
@@ -405,25 +510,46 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 			s.pending[0].severity = severity
 			break
 		}
-		if len(s.pending) > 0 {
-			s.extendedError = true
+		s.extendedError = true
+		if len(s.operations) > 0 && s.operations[0].syncGroup == s.backendSyncGroup {
+			operation := s.operations[0]
+			requestID := operation.requestID
+			if requestID == 0 && (operation.kind == operationParse || operation.kind == operationBind) {
+				requestID = s.findExecuteRequest(operation.syncGroup, operation.query)
+			}
+			if requestID != 0 {
+				s.finishRequest(requestID, at, code, message, severity, "")
+			} else if operation.query != "" && (operation.kind == operationParse || operation.kind == operationBind) {
+				s.emitOperationError(operation, at, code, message, severity)
+			}
+			break
 		}
-		s.finishFirst(at, code, message, severity, "")
 	case 'I': // EmptyQueryResponse
-		if len(s.pending) > 0 && !s.pending[0].simple {
-			s.finishFirst(at, "", "", "", "")
+		if operation, ok := s.consumeOperation(operationExecute); ok {
+			s.finishRequest(operation.requestID, at, "", "", "", "")
+		}
+	case '1': // ParseComplete
+		s.consumeOperation(operationParse)
+	case '2': // BindComplete
+		s.consumeOperation(operationBind)
+	case '3': // CloseComplete
+		s.consumeOperation(operationClose)
+	case 'T', 'n': // RowDescription or NoData completes Describe.
+		if len(s.operations) > 0 && s.operations[0].syncGroup == s.backendSyncGroup && s.operations[0].kind == operationDescribe {
+			s.operations = s.operations[1:]
 		}
 	case 'Z': // ReadyForQuery is the boundary for one Simple Query message.
 		if len(s.pending) > 0 && s.pending[0].simple {
 			s.finishFirst(at, "", "", "", "")
 		}
 		if s.backendSyncGroup < s.frontendSyncGroup {
+			reason := "sync_without_completion"
 			if s.extendedError {
-				for len(s.pending) > 0 && !s.pending[0].simple && s.pending[0].syncGroup == s.backendSyncGroup {
-					s.finishFirst(at, "", "", "", "aborted_after_error")
-				}
-				s.extendedError = false
+				reason = "aborted_after_error"
 			}
+			s.finishSyncGroup(s.backendSyncGroup, at, reason)
+			s.dropSyncGroupOperations(s.backendSyncGroup, true)
+			s.extendedError = false
 			s.backendSyncGroup++
 		}
 		if len(payload) > 0 {
@@ -432,12 +558,130 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 	}
 }
 
+func (s *Session) consumeOperation(kind operationKind) (frontendOperation, bool) {
+	if len(s.operations) == 0 || s.operations[0].syncGroup != s.backendSyncGroup || s.operations[0].kind != kind {
+		return frontendOperation{}, false
+	}
+	operation := s.operations[0]
+	s.operations = s.operations[1:]
+	return operation, true
+}
+
+func (s *Session) findExecuteRequest(syncGroup uint64, query string) uint64 {
+	for _, operation := range s.operations {
+		if operation.syncGroup != syncGroup {
+			break
+		}
+		if operation.kind == operationExecute && operation.requestID != 0 && (query == "" || operation.query == query) {
+			return operation.requestID
+		}
+	}
+	return 0
+}
+
+func (s *Session) addCommand(requestID uint64, command Command) {
+	for index := range s.pending {
+		if s.pending[index].id == requestID {
+			s.pending[index].commands = append(s.pending[index].commands, command)
+			return
+		}
+	}
+}
+
+func (s *Session) finishRequest(requestID uint64, at time.Time, code, message, severity, incompleteReason string) {
+	if requestID == 0 {
+		return
+	}
+	for index := range s.pending {
+		if s.pending[index].id == requestID {
+			s.finishAt(index, at, code, message, severity, incompleteReason)
+			return
+		}
+	}
+}
+
+func (s *Session) finishSyncGroup(group uint64, at time.Time, reason string) {
+	for index := 0; index < len(s.pending); {
+		if !s.pending[index].simple && s.pending[index].syncGroup == group {
+			s.finishAt(index, at, "", "", "", reason)
+			continue
+		}
+		index++
+	}
+}
+
+func (s *Session) dropSyncGroupOperations(group uint64, rollback bool) {
+	count := 0
+	for count < len(s.operations) && s.operations[count].syncGroup == group {
+		count++
+	}
+	if rollback {
+		for index := count - 1; index >= 0; index-- {
+			s.rollbackOperation(s.operations[index])
+		}
+	}
+	s.operations = s.operations[count:]
+}
+
+func (s *Session) rollbackOperation(operation frontendOperation) {
+	if operation.kind == operationParse && operation.objectName == "" {
+		if operation.previousPortalSet {
+			s.portals[""] = operation.previousPortal
+		} else {
+			delete(s.portals, "")
+		}
+	}
+	if !operation.mutated {
+		return
+	}
+	restore := func(values map[string]string) {
+		if operation.previousFound {
+			values[operation.objectName] = operation.previousQuery
+		} else {
+			delete(values, operation.objectName)
+		}
+	}
+	switch operation.kind {
+	case operationParse:
+		restore(s.statements)
+	case operationBind:
+		if operation.previousFound {
+			s.portals[operation.objectName] = portal{query: operation.previousQuery}
+		} else {
+			delete(s.portals, operation.objectName)
+		}
+	case operationClose:
+		if operation.objectType == 'S' {
+			restore(s.statements)
+		} else if operation.objectType == 'P' && operation.previousFound {
+			s.portals[operation.objectName] = portal{query: operation.previousQuery}
+		}
+	}
+}
+
+func (s *Session) emitOperationError(operation frontendOperation, at time.Time, code, message, severity string) {
+	duration := at.Sub(operation.startedAt)
+	if duration < 0 {
+		duration = 0
+	}
+	s.emit(Event{
+		Query: operation.query, StartedAt: operation.startedAt, FinishedAt: at,
+		Duration: duration, ErrorCode: code, ErrorInfo: message, Severity: severity,
+		Metadata: operation.metadata, TransactionStatus: operation.transactionStatus,
+	})
+}
+
 func (s *Session) finishFirst(at time.Time, code, message, severity, incompleteReason string) {
 	if len(s.pending) == 0 {
 		return
 	}
-	pending := s.pending[0]
-	s.pending = s.pending[1:]
+	s.finishAt(0, at, code, message, severity, incompleteReason)
+}
+
+func (s *Session) finishAt(index int, at time.Time, code, message, severity, incompleteReason string) {
+	pending := s.pending[index]
+	copy(s.pending[index:], s.pending[index+1:])
+	s.pending = s.pending[:len(s.pending)-1]
 	if code == "" && message == "" && severity == "" {
 		code, message, severity = pending.errorCode, pending.errorInfo, pending.severity
 	}
@@ -476,6 +720,7 @@ func (s *Session) Gap(at time.Time) {
 	s.finishAll(at, "tcp_gap")
 	s.client = timedBuffer{}
 	s.server = timedBuffer{}
+	s.resetProtocolObjects()
 }
 
 // Abort reports pending requests as incomplete after malformed protocol data.
@@ -485,6 +730,15 @@ func (s *Session) Abort(at time.Time) {
 	s.finishAll(at, "protocol_error")
 	s.client = timedBuffer{}
 	s.server = timedBuffer{}
+	s.resetProtocolObjects()
+}
+
+func (s *Session) resetProtocolObjects() {
+	s.operations = nil
+	s.statements = make(map[string]string)
+	s.portals = make(map[string]portal)
+	s.backendSyncGroup = s.frontendSyncGroup
+	s.extendedError = false
 }
 
 // Close reports requests that were still in flight when reassembly ended.

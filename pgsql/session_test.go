@@ -236,6 +236,306 @@ func TestSessionMarksSkippedPipelineQueriesAfterError(t *testing.T) {
 	}
 }
 
+func TestSessionCorrelatesBindErrorInsidePipeline(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(395, 0)
+
+	var frontend []byte
+	for index, query := range []string{"SELECT 1", "SELECT $1::int"} {
+		name := "statement_" + strconv.Itoa(index)
+		portalName := "portal_" + strconv.Itoa(index)
+		frontend = append(frontend, message('P', append(append(cstring(name), cstring(query)...), 0, 0))...)
+		frontend = append(frontend, message('B', append(cstring(portalName), cstring(name)...))...)
+		frontend = append(frontend, message('E', append(cstring(portalName), 0, 0, 0, 0))...)
+	}
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+
+	firstResult := append(message('1', nil), message('2', nil)...)
+	firstResult = append(firstResult, message('C', cstring("SELECT 1"))...)
+	firstResult = append(firstResult, message('1', nil)...)
+	if err := session.Feed(ServerToClient, firstResult, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("22P02")...)
+	errorPayload = append(errorPayload, 'M')
+	errorPayload = append(errorPayload, cstring("invalid input syntax for integer")...)
+	errorPayload = append(errorPayload, 0)
+	if err := session.Feed(ServerToClient, message('E', errorPayload), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('Z', []byte{'I'}), t0.Add(3*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 2 {
+		t.Fatalf("events = %+v", events)
+	}
+	if events[0].Query != "SELECT 1" || events[0].ErrorCode != "" {
+		t.Fatalf("first event = %+v", events[0])
+	}
+	if events[1].Query != "SELECT $1::int" || events[1].ErrorCode != "22P02" || events[1].Incomplete {
+		t.Fatalf("bind error event = %+v", events[1])
+	}
+}
+
+func TestSessionReportsParseErrorWithoutExecute(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(396, 0)
+	parse := message('P', append(append(cstring("bad"), cstring("SELEC 1")...), 0, 0))
+	frontend := append(parse, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("42601")...)
+	errorPayload = append(errorPayload, 0)
+	backend := append(message('E', errorPayload), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Query != "SELEC 1" || events[0].ErrorCode != "42601" || events[0].Incomplete {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionFailedNamedParseRestoresPreparedStatement(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(396, 0)
+	cycle := func(statement, portalName, query string, includeParse bool) []byte {
+		var result []byte
+		if includeParse {
+			result = message('P', append(append(cstring(statement), cstring(query)...), 0, 0))
+		}
+		result = append(result, message('B', append(cstring(portalName), cstring(statement)...))...)
+		result = append(result, message('E', append(cstring(portalName), 0, 0, 0, 0))...)
+		return append(result, message('S', nil)...)
+	}
+
+	if err := session.Feed(ClientToServer, cycle("shared", "first", "SELECT 1", true), t0); err != nil {
+		t.Fatal(err)
+	}
+	firstBackend := append(message('1', nil), message('2', nil)...)
+	firstBackend = append(firstBackend, message('C', cstring("SELECT 1"))...)
+	firstBackend = append(firstBackend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, firstBackend, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := session.Feed(ClientToServer, cycle("shared", "redefined", "SELECT 2", true), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("42P05")...)
+	errorPayload = append(errorPayload, 0)
+	if err := session.Feed(ServerToClient, append(message('E', errorPayload), message('Z', []byte{'I'})...), t0.Add(3*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := session.Feed(ClientToServer, cycle("shared", "reused", "", false), t0.Add(4*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	reusedBackend := append(message('2', nil), message('C', cstring("SELECT 1"))...)
+	reusedBackend = append(reusedBackend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, reusedBackend, t0.Add(5*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(events) != 3 || events[0].Query != "SELECT 1" || events[1].Query != "SELECT 2" ||
+		events[1].ErrorCode != "42P05" || events[2].Query != "SELECT 1" || events[2].ErrorCode != "" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionDescribeDoesNotStealExecuteCompletion(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(397, 0)
+	parse := message('P', append(append(cstring("describe_me"), cstring("SELECT 1")...), 0, 0))
+	bind := message('B', append(cstring("describe_portal"), cstring("describe_me")...))
+	describe := message('D', append([]byte{'P'}, cstring("describe_portal")...))
+	execute := message('E', append(cstring("describe_portal"), 0, 0, 0, 0))
+	frontend := append(parse, bind...)
+	frontend = append(frontend, describe...)
+	frontend = append(frontend, execute...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('1', nil), message('2', nil)...)
+	backend = append(backend, message('T', nil)...) // Describe response.
+	backend = append(backend, message('T', nil)...) // Execute response.
+	backend = append(backend, message('C', cstring("SELECT 1"))...)
+	backend = append(backend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(5*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Query != "SELECT 1" || events[0].Incomplete || len(events[0].Commands) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionPortalCanBeExecutedInChunks(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(398, 0)
+	parse := message('P', append(append(cstring("chunked"), cstring("SELECT generate_series(1, 4)")...), 0, 0))
+	bind := message('B', append(cstring("chunked_portal"), cstring("chunked")...))
+	executePayload := append(cstring("chunked_portal"), 0, 0, 0, 2)
+	frontend := append(parse, bind...)
+	frontend = append(frontend, message('E', executePayload)...)
+	frontend = append(frontend, message('E', executePayload)...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('1', nil), message('2', nil)...)
+	backend = append(backend, message('s', nil)...)
+	backend = append(backend, message('C', cstring("SELECT 4"))...)
+	backend = append(backend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(5*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Commands[0].Tag != "PORTAL SUSPENDED" || events[1].Commands[0].RowsAffected != 4 {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionPipelineRecoversAtNextSyncGroup(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(399, 0)
+	cycle := func(name, query string) []byte {
+		result := message('P', append(append(cstring(name), cstring(query)...), 0, 0))
+		result = append(result, message('B', append(cstring(name+"_portal"), cstring(name)...))...)
+		return append(result, message('E', append(cstring(name+"_portal"), 0, 0, 0, 0))...)
+	}
+	frontend := append(cycle("bad", "SELECT 1 / 0"), message('S', nil)...)
+	frontend = append(frontend, cycle("good", "SELECT 2")...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("22012")...)
+	errorPayload = append(errorPayload, 0)
+	firstGroup := append(message('1', nil), message('2', nil)...)
+	firstGroup = append(firstGroup, message('E', errorPayload)...)
+	firstGroup = append(firstGroup, message('Z', []byte{'I'})...)
+	secondGroup := append(message('1', nil), message('2', nil)...)
+	secondGroup = append(secondGroup, message('C', cstring("SELECT 1"))...)
+	secondGroup = append(secondGroup, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, append(firstGroup, secondGroup...), t0.Add(5*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ErrorCode != "22012" || events[1].Query != "SELECT 2" || events[1].Incomplete {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionUnnamedParseInvalidatesUnnamedPortal(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(400, 0)
+	firstParse := message('P', append(append(cstring(""), cstring("SELECT 1")...), 0, 0))
+	bind := message('B', append(cstring(""), cstring("")...))
+	secondParse := message('P', append(append(cstring(""), cstring("SELECT 2")...), 0, 0))
+	execute := message('E', append(cstring(""), 0, 0, 0, 0))
+	frontend := append(firstParse, bind...)
+	frontend = append(frontend, secondParse...)
+	frontend = append(frontend, execute...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('1', nil), message('2', nil)...)
+	backend = append(backend, message('1', nil)...)
+	errorPayload := append([]byte{'C'}, cstring("34000")...)
+	errorPayload = append(errorPayload, 0)
+	backend = append(backend, message('E', errorPayload)...)
+	backend = append(backend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("stale unnamed portal was attributed to a query: %+v", events)
+	}
+}
+
+func TestSessionExtendedCopyInAndOutCompleteAtCommandComplete(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		query        string
+		copyResponse byte
+		frontendCopy []byte
+		command      string
+		rowsAffected uint64
+	}{
+		{name: "copy_out", query: "COPY (SELECT 1) TO STDOUT", copyResponse: 'H', command: "COPY 1", rowsAffected: 1},
+		{name: "copy_in", query: "COPY target FROM STDIN", copyResponse: 'G', frontendCopy: append(message('d', []byte("1\n")), message('c', nil)...), command: "COPY 1", rowsAffected: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var events []Event
+			session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+			t0 := time.Unix(401, 0)
+			parse := message('P', append(append(cstring("copy_statement"), cstring(test.query)...), 0, 0))
+			bind := message('B', append(cstring("copy_portal"), cstring("copy_statement")...))
+			execute := message('E', append(cstring("copy_portal"), 0, 0, 0, 0))
+			frontend := append(parse, bind...)
+			frontend = append(frontend, execute...)
+			frontend = append(frontend, test.frontendCopy...)
+			frontend = append(frontend, message('S', nil)...)
+			if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+				t.Fatal(err)
+			}
+			backend := append(message('1', nil), message('2', nil)...)
+			backend = append(backend, message(test.copyResponse, nil)...)
+			if test.copyResponse == 'H' {
+				backend = append(backend, message('d', []byte("1\n"))...)
+				backend = append(backend, message('c', nil)...)
+			}
+			backend = append(backend, message('C', cstring(test.command))...)
+			backend = append(backend, message('Z', []byte{'I'})...)
+			if err := session.Feed(ServerToClient, backend, t0.Add(5*time.Millisecond)); err != nil {
+				t.Fatal(err)
+			}
+			if len(events) != 1 || events[0].Query != test.query || events[0].Incomplete ||
+				len(events[0].Commands) != 1 || events[0].Commands[0].Tag != "COPY" || events[0].Commands[0].RowsAffected != test.rowsAffected {
+				t.Fatalf("events = %+v", events)
+			}
+		})
+	}
+}
+
+func TestSessionGapDropsStaleExtendedProtocolState(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(402, 0)
+	parse := message('P', append(append(cstring("old"), cstring("SELECT 1")...), 0, 0))
+	bind := message('B', append(cstring("old_portal"), cstring("old")...))
+	execute := message('E', append(cstring("old_portal"), 0, 0, 0, 0))
+	frontend := append(parse, bind...)
+	frontend = append(frontend, execute...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	session.Gap(t0.Add(time.Millisecond))
+	if err := session.Feed(ClientToServer, message('Q', cstring("SELECT 2")), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('C', cstring("SELECT 1")), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(3*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].Query != "SELECT 1" || events[0].IncompleteReason != "tcp_gap" ||
+		events[1].Query != "SELECT 2" || events[1].Incomplete {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
 func TestSessionDetectsTLS(t *testing.T) {
 	var events []Event
 	session := NewSession(1024, Metadata{Client: "db-client"}, func(event Event) { events = append(events, event) })

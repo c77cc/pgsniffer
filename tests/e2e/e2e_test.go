@@ -216,6 +216,7 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 	client.simpleError(t, "SELECT 1 / 0", "22012")
 	client.simple(t, "BEGIN; UPDATE e2e_account SET balance = balance + 1 WHERE id = 1; COMMIT")
 	client.simple(t, "COPY (SELECT generate_series(1, 3)) TO STDOUT")
+	client.copyIn(t, "COPY e2e_account (id, balance) FROM STDIN", "2\t200\n")
 	if err := client.sendMessage('Q', cstring("SELECT pg_sleep(10)")); err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +227,7 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 	if err := <-cancelResult; err != nil {
 		t.Fatalf("cancel query: %v", err)
 	}
+	client.simple(t, "SELECT length('cancel recovery')")
 	client.close()
 
 	client = dialPostgres(t, port, false)
@@ -234,6 +236,8 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 	}
 	client.extendedError(t, "bad_math", "bad_math_portal", "SELECT $1::int / 0", []string{"1"}, "22012")
 	client.pipeline(t, []string{"SELECT lower('PIPELINE')", "SELECT upper('pipeline')"})
+	client.pipelineError(t, []string{"SELECT CAST('bad' AS integer)", "SELECT md5('skipped')"}, "22P02")
+	client.extended(t, "after_pipeline_error", "after_pipeline_error_portal", "SELECT current_schema()", nil)
 	client.close()
 
 	var wg sync.WaitGroup
@@ -273,13 +277,24 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 		pgsql.Fingerprint("SELECT 1 / 0"):          {1, 1},
 		pgsql.Fingerprint("BEGIN; UPDATE e2e_account SET balance = balance + 1 WHERE id = 1; COMMIT"): {1, 0},
 		pgsql.Fingerprint("COPY (SELECT generate_series(1, 3)) TO STDOUT"):                            {1, 0},
+		pgsql.Fingerprint("COPY e2e_account (id, balance) FROM STDIN"):                                {1, 0},
+		pgsql.Fingerprint("SELECT length('cancel recovery')"):                                         {1, 0},
 		pgsql.Fingerprint("SELECT $1::int + 1"):                                                       {8, 0},
 		pgsql.Fingerprint("SELECT $1::int / 0"):                                                       {1, 1},
 		pgsql.Fingerprint("SELECT current_database()"):                                                {20, 0},
 		pgsql.Fingerprint("SELECT lower('PIPELINE')"):                                                 {1, 0},
 		pgsql.Fingerprint("SELECT upper('pipeline')"):                                                 {1, 0},
+		pgsql.Fingerprint("SELECT CAST('bad' AS integer)"):                                            {1, 1},
+		pgsql.Fingerprint("SELECT md5('skipped')"):                                                    {1, 0},
+		pgsql.Fingerprint("SELECT current_schema()"):                                                  {1, 0},
 	}
-	h.assertQueries(t, live, want)
+	h.assertQueries(t, live, want, map[string]uint64{
+		pgsql.Fingerprint("SELECT md5('skipped')"): 1,
+	})
+	skippedSummary := findSummary(t, live, pgsql.Fingerprint("SELECT md5('skipped')"))
+	if skippedSummary.Incomplete != 1 || skippedSummary.IncompleteReasons["aborted_after_error"] != 1 {
+		t.Fatalf("unexpected skipped pipeline query: %+v", skippedSummary)
+	}
 	selectSummary := findSummary(t, live, pgsql.Fingerprint("SELECT 42"))
 	if selectSummary.Dimensions.User != "postgres" || selectSummary.Dimensions.Database != "postgres" ||
 		selectSummary.Dimensions.ApplicationName != "pgsniffer-e2e" || selectSummary.Dimensions.ClientAddress != "127.0.0.1" {
@@ -622,7 +637,7 @@ func findSummary(t *testing.T, report report, fingerprint string) summary {
 	return summary{}
 }
 
-func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct{ count, errors uint64 }) {
+func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct{ count, errors uint64 }, wantIncomplete map[string]uint64) {
 	t.Helper()
 	if len(got.Queries) != len(want) {
 		t.Fatalf("query group count=%d, want %d: %+v", len(got.Queries), len(want), got.Queries)
@@ -633,8 +648,9 @@ func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct
 			t.Errorf("unexpected fingerprint %q", query.Fingerprint)
 			continue
 		}
-		if query.Count != expected.count || query.Errors != expected.errors || query.Incomplete != 0 {
-			t.Errorf("summary for %q = %+v, want count=%d errors=%d incomplete=0", query.Fingerprint, query, expected.count, expected.errors)
+		expectedIncomplete := wantIncomplete[query.Fingerprint]
+		if query.Count != expected.count || query.Errors != expected.errors || query.Incomplete != expectedIncomplete {
+			t.Errorf("summary for %q = %+v, want count=%d errors=%d incomplete=%d", query.Fingerprint, query, expected.count, expected.errors, expectedIncomplete)
 		}
 		if query.Latency.Min < 0 || query.Latency.Max < query.Latency.Min || query.Latency.Total < query.Latency.Max {
 			t.Errorf("invalid duration aggregate for %q: %+v", query.Fingerprint, query)
@@ -883,6 +899,49 @@ func (c *pgClient) pipeline(t *testing.T, queries []string) {
 	}
 	if err := c.readUntilReady(""); err != nil {
 		t.Fatalf("read pipeline: %v", err)
+	}
+}
+
+func (c *pgClient) pipelineError(t *testing.T, queries []string, code string) {
+	t.Helper()
+	var batch []byte
+	for i, query := range queries {
+		batch = append(batch, c.extendedCycle(fmt.Sprintf("error_pipeline_%d", i), fmt.Sprintf("error_pipeline_portal_%d", i), query, nil)...)
+	}
+	batch = append(batch, frame('S', nil)...)
+	if _, err := c.conn.Write(batch); err != nil {
+		t.Fatalf("write error pipeline: %v", err)
+	}
+	if err := c.readUntilReady(code); err != nil {
+		t.Fatalf("read error pipeline: %v", err)
+	}
+}
+
+func (c *pgClient) copyIn(t *testing.T, query, data string) {
+	t.Helper()
+	if err := c.sendMessage('Q', cstring(query)); err != nil {
+		t.Fatalf("start COPY IN: %v", err)
+	}
+	for {
+		typ, payload, err := c.readMessage()
+		if err != nil {
+			t.Fatalf("wait for COPY IN response: %v", err)
+		}
+		switch typ {
+		case 'E':
+			t.Fatalf("COPY IN rejected: %s", errorField(payload, 'M'))
+		case 'G':
+			if err := c.sendMessage('d', []byte(data)); err != nil {
+				t.Fatalf("send COPY data: %v", err)
+			}
+			if err := c.sendMessage('c', nil); err != nil {
+				t.Fatalf("finish COPY data: %v", err)
+			}
+			if err := c.readUntilReady(""); err != nil {
+				t.Fatalf("complete COPY IN: %v", err)
+			}
+			return
+		}
 	}
 }
 

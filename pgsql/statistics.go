@@ -15,7 +15,7 @@ import (
 
 const histogramBuckets = 64
 
-const maxFingerprintInput = 64 << 10
+const maxSQLInput = 64 << 10
 
 type latencyHistogram [histogramBuckets]uint64
 
@@ -51,8 +51,7 @@ func (h latencyHistogram) quantile(q float64, count uint64) time.Duration {
 }
 
 type queryStats struct {
-	fingerprint         string
-	example             string
+	sql                 string
 	dimensions          Metadata
 	count               uint64
 	errors              uint64
@@ -70,7 +69,7 @@ type queryStats struct {
 }
 
 type queryKey struct {
-	fingerprint     string
+	sql             string
 	user            string
 	database        string
 	applicationName string
@@ -80,7 +79,7 @@ type queryKey struct {
 // Summary is an immutable statistics snapshot suitable for table or JSON output.
 type Summary struct {
 	Fingerprint         string
-	Example             string
+	Query               string
 	Dimensions          Metadata
 	Count               uint64
 	Errors              uint64
@@ -109,8 +108,8 @@ type latencyMilliseconds struct {
 }
 
 type summaryJSON struct {
-	Fingerprint         string              `json:"fingerprint"`
-	Example             string              `json:"example,omitempty"`
+	Fingerprint         string              `json:"fingerprint,omitempty"`
+	Query               string              `json:"query,omitempty"`
 	Dimensions          Metadata            `json:"dimensions,omitempty"`
 	Calls               uint64              `json:"calls"`
 	Errors              uint64              `json:"errors"`
@@ -126,7 +125,7 @@ type summaryJSON struct {
 
 func (s Summary) MarshalJSON() ([]byte, error) {
 	return json.Marshal(summaryJSON{
-		Fingerprint: s.Fingerprint, Example: s.Example, Dimensions: s.Dimensions, Calls: s.Count,
+		Fingerprint: s.Fingerprint, Query: s.Query, Dimensions: s.Dimensions, Calls: s.Count,
 		Errors: s.Errors, Incomplete: s.Incomplete, RowsAffected: s.RowsAffected,
 		CommandTags: s.CommandTags, SQLStates: s.SQLStates, Severities: s.Severities,
 		TransactionStatuses: s.TransactionStatuses, IncompleteReasons: s.IncompleteReasons,
@@ -144,7 +143,7 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*s = Summary{
-		Fingerprint: value.Fingerprint, Example: value.Example, Dimensions: value.Dimensions, Count: value.Calls,
+		Fingerprint: value.Fingerprint, Query: value.Query, Dimensions: value.Dimensions, Count: value.Calls,
 		Errors: value.Errors, Incomplete: value.Incomplete, RowsAffected: value.RowsAffected,
 		CommandTags: value.CommandTags, SQLStates: value.SQLStates, Severities: value.Severities,
 		TransactionStatuses: value.TransactionStatuses, IncompleteReasons: value.IncompleteReasons,
@@ -190,13 +189,13 @@ type CaptureStatistics struct {
 }
 
 // Collector keeps bounded aggregate state. It never stores individual latency
-// samples and caps the number of distinct SQL fingerprints.
+// samples and caps the number of distinct SQL aggregation keys.
 type Collector struct {
 	mu sync.RWMutex
 
-	queries      map[queryKey]*queryStats
-	maxQueries   int
-	showExamples bool
+	queries    map[queryKey]*queryStats
+	maxQueries int
+	rawSQL     bool
 
 	encryptedSessions uint64
 	decodeErrors      uint64
@@ -204,13 +203,12 @@ type Collector struct {
 	capture           CaptureStatistics
 }
 
-func NewCollector(maxQueries int, showExamples bool) *Collector {
+func NewCollector(maxQueries int, rawSQL bool) *Collector {
 	if maxQueries <= 0 {
 		maxQueries = 10000
 	}
 	return &Collector{
-		queries: make(map[queryKey]*queryStats), maxQueries: maxQueries,
-		showExamples: showExamples,
+		queries: make(map[queryKey]*queryStats), maxQueries: maxQueries, rawSQL: rawSQL,
 	}
 }
 
@@ -227,41 +225,42 @@ func (c *Collector) Add(event Event) {
 	}
 	query := event.Query
 	truncated := false
-	if len(query) > maxFingerprintInput {
-		query = query[:maxFingerprintInput]
+	if len(query) > maxSQLInput {
+		query = query[:maxSQLInput]
 		truncated = true
 	}
-	fingerprint := Fingerprint(query)
-	if truncated {
-		fingerprint += " …[truncated]"
+	aggregationSQL := query
+	if !c.rawSQL {
+		aggregationSQL = Fingerprint(query)
 	}
-	if fingerprint == "" {
+	if truncated {
+		aggregationSQL += " …[truncated]"
+	}
+	if aggregationSQL == "" {
 		return
 	}
 	dimensions := aggregateDimensions(event.Metadata)
 	key := queryKey{
-		fingerprint: fingerprint, user: dimensions.User, database: dimensions.Database,
+		sql: aggregationSQL, user: dimensions.User, database: dimensions.Database,
 		applicationName: dimensions.ApplicationName, clientAddress: dimensions.ClientAddress,
 	}
 	stats, found := c.queries[key]
 	if !found {
 		if len(c.queries) >= c.maxQueries {
 			c.droppedKeys++
-			key = queryKey{fingerprint: "[other fingerprints]"}
+			overflowKey := "[other fingerprints]"
+			if c.rawSQL {
+				overflowKey = "[other queries]"
+			}
+			key = queryKey{sql: overflowKey}
 			stats = c.queries[key]
 		}
 		if stats == nil {
 			stats = &queryStats{
-				fingerprint: key.fingerprint, dimensions: dimensions,
+				sql: key.sql, dimensions: dimensions,
 				commandTags: make(map[string]uint64), sqlstates: make(map[string]uint64),
 				severities: make(map[string]uint64), transactionStatuses: make(map[string]uint64),
 				incompleteReasons: make(map[string]uint64),
-			}
-			if c.showExamples && key.fingerprint != "[other fingerprints]" {
-				stats.example = query
-				if truncated {
-					stats.example += " …[truncated]"
-				}
 			}
 			c.queries[key] = stats
 		}
@@ -375,16 +374,20 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 		}
 		p95 := min(stats.histogram.quantile(.95, stats.count), stats.max)
 		p99 := min(stats.histogram.quantile(.99, stats.count), stats.max)
-		report.Queries = append(report.Queries, Summary{
-			Fingerprint: stats.fingerprint, Example: stats.example, Dimensions: stats.dimensions,
+		summary := Summary{Dimensions: stats.dimensions,
 			Count: stats.count, Errors: stats.errors, Incomplete: stats.incomplete,
 			RowsAffected: stats.rowsAffected, CommandTags: cloneCounts(stats.commandTags),
 			SQLStates: cloneCounts(stats.sqlstates), Severities: cloneCounts(stats.severities),
 			TransactionStatuses: cloneCounts(stats.transactionStatuses),
 			IncompleteReasons:   cloneCounts(stats.incompleteReasons),
 			Average:             average, Min: stats.min, Max: stats.max,
-			P95: p95, P99: p99, Total: stats.total,
-		})
+			P95: p95, P99: p99, Total: stats.total}
+		if c.rawSQL {
+			summary.Query = stats.sql
+		} else {
+			summary.Fingerprint = stats.sql
+		}
+		report.Queries = append(report.Queries, summary)
 	}
 	sort.Slice(report.Queries, func(i, j int) bool {
 		left, right := report.Queries[i], report.Queries[j]
@@ -404,8 +407,8 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 		if leftValue != rightValue {
 			return leftValue > rightValue
 		}
-		if left.Fingerprint != right.Fingerprint {
-			return left.Fingerprint < right.Fingerprint
+		if left.SQL() != right.SQL() {
+			return left.SQL() < right.SQL()
 		}
 		return dimensionsKey(left.Dimensions) < dimensionsKey(right.Dimensions)
 	})
@@ -413,6 +416,14 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 		report.Queries = report.Queries[:topN]
 	}
 	return report
+}
+
+// SQL returns the raw query in raw SQL mode or the normalized fingerprint.
+func (s Summary) SQL() string {
+	if s.Query != "" {
+		return s.Query
+	}
+	return s.Fingerprint
 }
 
 func dimensionsKey(metadata Metadata) string {
@@ -446,10 +457,7 @@ func WriteTable(w io.Writer, report Report) error {
 		return err
 	}
 	for _, summary := range report.Queries {
-		query := summary.Fingerprint
-		if summary.Example != "" {
-			query = strings.ReplaceAll(summary.Example, "\n", " ")
-		}
+		query := strings.ReplaceAll(summary.SQL(), "\n", " ")
 		context := fmt.Sprintf("%s/%s/%s@%s", summary.Dimensions.User, summary.Dimensions.Database,
 			summary.Dimensions.ApplicationName, summary.Dimensions.ClientAddress)
 		if _, err := fmt.Fprintf(tw, "%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
@@ -478,7 +486,7 @@ func WritePrometheus(w io.Writer, report Report) error {
 		return err
 	}
 	for _, summary := range report.Queries {
-		label := prometheusLabel(summary.Fingerprint)
+		label := prometheusLabel(summary.SQL())
 		dimensions := fmt.Sprintf("query=\"%s\",user=\"%s\",database=\"%s\",application=\"%s\",client=\"%s\"",
 			label, prometheusLabel(summary.Dimensions.User), prometheusLabel(summary.Dimensions.Database),
 			prometheusLabel(summary.Dimensions.ApplicationName), prometheusLabel(summary.Dimensions.ClientAddress))

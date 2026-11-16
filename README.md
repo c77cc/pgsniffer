@@ -50,7 +50,15 @@ Analyze an existing PCAP:
 
 `--server` is required and accepts an IP literal plus port. Use brackets for IPv6, for example `--server '[::1]:5432'`. Run `./pgsniffer -h` for all options.
 
-Raw SQL values are discarded by default. `--show-query-values` retains them and may expose sensitive data; `-v` logs completed queries while capture is running.
+Raw SQL values are discarded from reports by default. `--log-queries` logs every completed query with its original SQL to stderr while capture is running. `--group-by raw-sql` disables fingerprint grouping and groups reports by the complete original SQL instead. Both options may expose sensitive values. The default report mode is `--group-by fingerprint`.
+
+```bash
+# Stream every original SQL statement to the terminal.
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --log-queries
+
+# Group the final report by original SQL instead of fingerprints.
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --group-by raw-sql
+```
 
 ## Long-running observability
 
@@ -64,7 +72,7 @@ The endpoints are:
 
 - `GET /healthz` for liveness checks.
 - `GET /report` for the current cumulative JSON report, limited by `-n`.
-- `GET /metrics` for Prometheus text metrics across all bounded SQL fingerprint groups.
+- `GET /metrics` for Prometheus text metrics across all bounded SQL groups.
 
 Append periodic JSONL snapshots with:
 
@@ -75,7 +83,7 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
   --report-file /var/log/pgsniffer/reports.jsonl
 ```
 
-New report files are created with user-only permissions. The HTTP server has no built-in authentication, and reports may expose database names, users, client addresses, and SQL fingerprints. Do not bind it to a public address unless it is protected by a trusted authenticated proxy.
+New report files are created with user-only permissions. The HTTP server has no built-in authentication, and reports may expose database names, users, client addresses, SQL fingerprints, or raw SQL when `--group-by raw-sql` is enabled. Do not bind it to a public address unless it is protected by a trusted authenticated proxy.
 
 ## Output
 
@@ -128,7 +136,19 @@ Durations are reported in milliseconds:
 }
 ```
 
-`incomplete` counts requests without a complete response. `incomplete_reasons` distinguishes connection closure, capture/idle timeout, TCP gaps, protocol errors, and pipeline requests skipped after an error. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete. `dropped_query_keys` counts new fingerprint-and-dimension groups merged after the bounded aggregation limit was reached.
+`incomplete` counts requests without a complete response. `incomplete_reasons` distinguishes connection closure, capture/idle timeout, TCP gaps, protocol errors, and pipeline requests skipped after an error. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete. `dropped_query_keys` counts new SQL-and-dimension groups merged after the bounded aggregation limit was reached.
+
+With `--group-by raw-sql`, each entry is grouped by the exact original SQL and uses `query` instead of `fingerprint`:
+
+```json
+{
+  "query": "SELECT * FROM users WHERE id = 123",
+  "calls": 1
+}
+```
+
+Queries that differ only in literal values remain separate groups in this mode.
+For Extended Query protocol traffic, PostgreSQL sends SQL text and bind values separately; `--log-queries` and `--group-by raw-sql` show the original SQL text with placeholders such as `$1`, not a reconstructed SQL string.
 
 ## Timing semantics
 
