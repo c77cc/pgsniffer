@@ -12,7 +12,9 @@ PgSniffer passively analyzes PostgreSQL traffic. It reassembles TCP streams, und
 - Capture-loss, truncation, TCP-gap, and midstream-connection diagnostics.
 - Per-user, database, application, and client grouping with command tags, affected rows, SQLSTATE, severity, and transaction context.
 - SQL literal redaction and bounded in-memory aggregation by default.
+- PostgreSQL-aware normalization for strings, numbers, booleans, `IN` lists, and batched `VALUES`.
 - Explicit detection of TLS/GSS encrypted sessions.
+- Live HTTP health, JSON report, Prometheus endpoints, and periodic JSONL snapshots.
 
 ## Install
 
@@ -49,6 +51,31 @@ Analyze an existing PCAP:
 `--server` is required and accepts an IP literal plus port. Use brackets for IPv6, for example `--server '[::1]:5432'`. Run `./pgsniffer -h` for all options.
 
 Raw SQL values are discarded by default. `--show-query-values` retains them and may expose sensitive data; `-v` logs completed queries while capture is running.
+
+## Long-running observability
+
+Enable an HTTP endpoint bound to localhost:
+
+```bash
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
+```
+
+The endpoints are:
+
+- `GET /healthz` for liveness checks.
+- `GET /report` for the current cumulative JSON report, limited by `-n`.
+- `GET /metrics` for Prometheus text metrics across all bounded SQL fingerprint groups.
+
+Append periodic JSONL snapshots with:
+
+```bash
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
+  --listen 127.0.0.1:9108 \
+  --report-interval 1m \
+  --report-file /var/log/pgsniffer/reports.jsonl
+```
+
+New report files are created with user-only permissions. The HTTP server has no built-in authentication, and reports may expose database names, users, client addresses, and SQL fingerprints. Do not bind it to a public address unless it is protected by a trusted authenticated proxy.
 
 ## Output
 
@@ -108,6 +135,14 @@ Durations are reported in milliseconds:
 - Simple Query: client `Q` through server `ReadyForQuery`.
 - Extended Query: client `Execute` through `CommandComplete`, `PortalSuspended`, or `ErrorResponse`.
 - Interrupted requests use the last observed packet timestamp and are marked incomplete.
+
+## SQL fingerprint semantics
+
+- Keywords and unquoted identifiers are lowercased, with canonical whitespace, punctuation, and operator formatting.
+- Strings, dollar-quoted strings, numbers, booleans, and `NULL` become `?`; `$1`-style bind parameters are preserved.
+- Literal/parameter-only `IN (...)` and `ARRAY[...]` lists collapse to one placeholder.
+- Multi-row `VALUES` retains the first row shape and uses `...` for the remaining rows, avoiding fingerprints that differ only by batch size.
+- Double-quoted and `U&"..."` identifiers preserve their case and contents.
 
 ## Limitations and security
 

@@ -468,6 +468,11 @@ func WriteJSON(w io.Writer, report Report) error {
 	return encoder.Encode(report)
 }
 
+// WriteJSONLine writes one compact report for append-only periodic reporting.
+func WriteJSONLine(w io.Writer, report Report) error {
+	return json.NewEncoder(w).Encode(report)
+}
+
 func WritePrometheus(w io.Writer, report Report) error {
 	if _, err := fmt.Fprintln(w, "# HELP pgsniffer_query_calls_total Observed PostgreSQL query executions.\n# TYPE pgsniffer_query_calls_total counter"); err != nil {
 		return err

@@ -27,14 +27,17 @@ const maxQueryKeys = 10000
 var releaseVersion string
 
 type config struct {
-	interfaceName string
-	server        string
-	topN          int
-	verbose       bool
-	showValues    bool
-	listDevices   bool
-	readPCAP      string
-	version       bool
+	interfaceName  string
+	server         string
+	topN           int
+	verbose        bool
+	showValues     bool
+	listDevices    bool
+	readPCAP       string
+	listen         string
+	reportInterval time.Duration
+	reportFile     string
+	version        bool
 }
 
 type captureContext struct {
@@ -207,7 +210,7 @@ func runMain() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	collector := pgsql.NewCollector(maxQueryKeys, cfg.showValues)
-	captureErr := runCapture(ctx, cfg, collector)
+	captureErr := runCaptureWithServices(ctx, cfg, collector)
 	if err := pgsql.WriteJSON(os.Stdout, collector.Snapshot("max", cfg.topN)); err != nil {
 		return err
 	}
@@ -227,6 +230,9 @@ func parseFlags(args []string) (config, error) {
 	flags.BoolVar(&cfg.showValues, "show-query-values", false, "show and retain raw query values (sensitive)")
 	flags.BoolVar(&cfg.listDevices, "l", false, "list capture interfaces and exit")
 	flags.StringVar(&cfg.readPCAP, "read-pcap", "", "read packets from a PCAP file instead of an interface")
+	flags.StringVar(&cfg.listen, "listen", "", "HTTP address for /healthz, /report, and /metrics")
+	flags.DurationVar(&cfg.reportInterval, "report-interval", 0, "periodic JSONL report interval (requires --report-file)")
+	flags.StringVar(&cfg.reportFile, "report-file", "", "append periodic JSON reports to this file")
 	flags.BoolVar(&cfg.version, "version", false, "print version and exit")
 	if err := flags.Parse(args); err != nil {
 		return config{}, err
@@ -243,6 +249,15 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.topN < 0 {
 		return fmt.Errorf("top N cannot be negative")
+	}
+	if cfg.reportInterval < 0 {
+		return fmt.Errorf("--report-interval cannot be negative")
+	}
+	if cfg.reportInterval > 0 && cfg.reportFile == "" {
+		return fmt.Errorf("--report-file is required with --report-interval")
+	}
+	if cfg.reportFile != "" && cfg.reportInterval == 0 {
+		return fmt.Errorf("--report-interval is required with --report-file")
 	}
 	if cfg.readPCAP == "" && cfg.interfaceName == "" {
 		return fmt.Errorf("-i is required for live capture on this platform; use -l to list interfaces")
@@ -285,14 +300,7 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 		return err
 	}
 	defer handle.Close()
-	defer func() {
-		stats, statsErr := handle.Stats()
-		if statsErr != nil {
-			collector.AddCaptureStatisticsError()
-			return
-		}
-		collector.SetKernelCaptureStatistics(stats.PacketsReceived, stats.PacketsDropped, stats.InterfaceDropped)
-	}()
+	defer updateCaptureStatistics(handle, collector)
 
 	factory := &pgStreamFactory{
 		serverIP: server.Addr().String(), serverPort: layers.TCPPort(server.Port()), collector: collector,
@@ -307,6 +315,8 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	packets := source.Packets()
 	flushTicker := time.NewTicker(30 * time.Second)
 	defer flushTicker.Stop()
+	statisticsTicker := time.NewTicker(10 * time.Second)
+	defer statisticsTicker.Stop()
 	latestCaptureTime := time.Time{}
 	packetCount := uint64(0)
 	for {
@@ -318,6 +328,8 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 			if !latestCaptureTime.IsZero() {
 				assembler.FlushCloseOlderThan(latestCaptureTime.Add(-2 * time.Minute))
 			}
+		case <-statisticsTicker.C:
+			updateCaptureStatistics(handle, collector)
 		case packet, ok := <-packets:
 			if !ok || packet == nil {
 				assembler.FlushAll()
@@ -355,6 +367,15 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 			}
 		}
 	}
+}
+
+func updateCaptureStatistics(handle captureHandle, collector *pgsql.Collector) {
+	stats, err := handle.Stats()
+	if err != nil {
+		collector.AddCaptureStatisticsError()
+		return
+	}
+	collector.SetKernelCaptureStatistics(stats.PacketsReceived, stats.PacketsDropped, stats.InterfaceDropped)
 }
 
 func packetMatchesServer(network gopacket.NetworkLayer, tcp *layers.TCP, server netip.AddrPort) bool {

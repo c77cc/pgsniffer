@@ -12,7 +12,9 @@ PgSniffer 是一个旁路 PostgreSQL 流量分析工具。它重组 TCP 流、�
 - 报告抓包丢包、截断包、TCP 缺口和中途开始的连接。
 - 按用户、数据库、应用和客户端分组，并统计命令标签、影响行数、SQLSTATE、错误级别和事务上下文。
 - 默认脱敏 SQL 字面量，并使用有界内存聚合。
+- 规范化 PostgreSQL 字符串、数值、布尔值、`IN` 列表和批量 `VALUES`，减少等价 SQL 产生重复指纹。
 - 检测 TLS/GSS 加密连接并单独计数。
+- 可通过 HTTP 实时提供健康状态、JSON 报告和 Prometheus 指标，并支持周期 JSONL 快照。
 
 ## 安装
 
@@ -49,6 +51,31 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
 `--server` 为必填参数，格式是 IP 字面量加端口。IPv6 需要使用方括号，例如 `--server '[::1]:5432'`。执行 `./pgsniffer -h` 可查看全部参数。
 
 程序默认丢弃原始 SQL 值。`--show-query-values` 会保留这些值，可能暴露敏感数据；`-v` 可在抓包期间记录已完成的查询。
+
+## 长期运行与实时观测
+
+启用只监听本机的 HTTP 接口：
+
+```bash
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
+```
+
+可用端点：
+
+- `GET /healthz`：存活检查。
+- `GET /report`：当前累计 JSON 报告，遵循 `-n` 限制。
+- `GET /metrics`：Prometheus 文本指标，包含全部有界 SQL 指纹聚合。
+
+周期性追加 JSONL 快照：
+
+```bash
+sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 \
+  --listen 127.0.0.1:9108 \
+  --report-interval 1m \
+  --report-file /var/log/pgsniffer/reports.jsonl
+```
+
+报告文件使用仅当前用户可读写的权限创建。HTTP 没有内置认证，报告和指标可能包含数据库、用户、客户端地址及 SQL 指纹；除非前面有受信任的认证代理，否则不要监听公网地址。
 
 ## 输出
 
@@ -108,6 +135,14 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
 - Simple Query：从客户端 `Q` 到服务端 `ReadyForQuery`。
 - Extended Query：从客户端 `Execute` 到服务端 `CommandComplete`、`PortalSuspended` 或 `ErrorResponse`。
 - 请求被中断时使用最后一个已观测数据包的时间戳，并标记为 `incomplete`。
+
+## SQL 指纹语义
+
+- SQL 关键字和未加引号的标识符转换为小写，空白、标点和运算符采用统一格式。
+- 字符串、dollar-quoted 字符串、数值、布尔值和 `NULL` 归一化为 `?`；`$1` 形式的绑定参数保留。
+- 仅含字面量或绑定参数的 `IN (...)` 和 `ARRAY[...]` 列表折叠为单个占位符。
+- 多行 `VALUES` 保留第一行结构，并用 `...` 表示其余行，从而避免批量大小导致指纹分裂。
+- 双引号和 `U&"..."` 标识符保留大小写和内容。
 
 ## 限制与安全
 

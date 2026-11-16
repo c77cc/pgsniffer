@@ -131,6 +131,16 @@ func TestValidateConfig(t *testing.T) {
 	if err := validateConfig(invalid); err != nil {
 		t.Fatalf("offline capture should not require an interface: %v", err)
 	}
+	invalid = valid
+	invalid.reportInterval = time.Minute
+	if err := validateConfig(invalid); err == nil {
+		t.Fatal("expected report file validation error")
+	}
+	invalid = valid
+	invalid.reportFile = "reports.jsonl"
+	if err := validateConfig(invalid); err == nil {
+		t.Fatal("expected report interval validation error")
+	}
 	if got := serverBPFFilter(mustServerEndpoint(t, "127.0.0.1:55432")); got != "host 127.0.0.1 and tcp port 55432" {
 		t.Fatalf("IPv4 filter = %q", got)
 	}
@@ -140,11 +150,11 @@ func TestValidateConfig(t *testing.T) {
 }
 
 func TestParseFlags(t *testing.T) {
-	cfg, err := parseFlags([]string{"-i", "lo", "--server", "127.0.0.1:55432", "-n", "0", "-v"})
+	cfg, err := parseFlags([]string{"-i", "lo", "--server", "127.0.0.1:55432", "-n", "0", "-v", "--listen", "127.0.0.1:9108", "--report-interval", "1m", "--report-file", "reports.jsonl"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.interfaceName != "lo" || cfg.server != "127.0.0.1:55432" || cfg.topN != 0 || !cfg.verbose {
+	if cfg.interfaceName != "lo" || cfg.server != "127.0.0.1:55432" || cfg.topN != 0 || !cfg.verbose || cfg.listen != "127.0.0.1:9108" || cfg.reportInterval != time.Minute || cfg.reportFile != "reports.jsonl" {
 		t.Fatalf("config = %+v", cfg)
 	}
 	if _, err := parseFlags([]string{"unexpected"}); err == nil {
