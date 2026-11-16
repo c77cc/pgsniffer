@@ -3,28 +3,31 @@
 package main
 
 import (
-	"encoding/binary"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync"
 	"time"
-	"unsafe"
 
 	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/afpacket"
 	"github.com/gopacket/gopacket/layers"
 	"golang.org/x/net/bpf"
 	"golang.org/x/sys/unix"
 )
 
-const linuxCaptureBufferSize = 65536
+const (
+	linuxCaptureBufferSize = 65536
+	linuxCaptureBlockSize  = 1 << 20
+	linuxCaptureBlocks     = 64
+)
 
 func defaultCaptureInterface() string { return "lo" }
 
 type linuxCapture struct {
-	mu             sync.Mutex
-	fd             int
-	interfaceIndex int
+	mu        sync.Mutex
+	packet    *afpacket.TPacket
+	promiscFD int
 }
 
 func openLiveCapture(interfaceName string, server netip.AddrPort) (captureHandle, error) {
@@ -32,88 +35,75 @@ func openLiveCapture(interfaceName string, server netip.AddrPort) (captureHandle
 	if err != nil {
 		return nil, fmt.Errorf("open interface %q: %w", interfaceName, err)
 	}
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(networkByteOrder(unix.ETH_P_ALL)))
+	promiscFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open AF_PACKET socket on %q: %w", interfaceName, err)
+		return nil, fmt.Errorf("open promiscuous membership socket on %q: %w", interfaceName, err)
 	}
-	capture := &linuxCapture{fd: fd, interfaceIndex: iface.Index}
-	fail := func(action string, failure error) (captureHandle, error) {
-		capture.Close()
-		return nil, fmt.Errorf("%s on interface %q: %w", action, interfaceName, failure)
-	}
-	if err := unix.Bind(fd, &unix.SockaddrLinklayer{Protocol: networkByteOrder(unix.ETH_P_ALL), Ifindex: iface.Index}); err != nil {
-		return fail("bind AF_PACKET socket", err)
-	}
-	if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_TIMESTAMPNS, 1); err != nil {
-		return fail("enable packet timestamps", err)
-	}
-	_ = unix.SetsockoptInt(fd, unix.SOL_SOCKET, unix.SO_RCVBUF, 4<<20)
 	request := &unix.PacketMreq{Ifindex: int32(iface.Index), Type: unix.PACKET_MR_PROMISC}
-	if err := unix.SetsockoptPacketMreq(fd, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, request); err != nil {
-		return fail("enable promiscuous capture", err)
+	if err := unix.SetsockoptPacketMreq(promiscFD, unix.SOL_PACKET, unix.PACKET_ADD_MEMBERSHIP, request); err != nil {
+		_ = unix.Close(promiscFD)
+		return nil, fmt.Errorf("enable promiscuous capture on interface %q: %w", interfaceName, err)
 	}
+	packet, err := afpacket.NewTPacket(
+		afpacket.OptInterface(interfaceName),
+		afpacket.OptFrameSize(linuxCaptureBufferSize),
+		afpacket.OptBlockSize(linuxCaptureBlockSize),
+		afpacket.OptNumBlocks(linuxCaptureBlocks),
+		afpacket.OptPollTimeout(500*time.Millisecond),
+		afpacket.OptTPacketVersion(afpacket.TPacketVersion3),
+	)
+	if err != nil {
+		_ = unix.Close(promiscFD)
+		return nil, fmt.Errorf("open TPACKET_V3 ring on interface %q: %w", interfaceName, err)
+	}
+	capture := &linuxCapture{packet: packet, promiscFD: promiscFD}
 	filter, err := serverPortFilter(server.Port())
 	if err != nil {
-		return fail("compile packet filter", err)
+		capture.Close()
+		return nil, fmt.Errorf("compile packet filter on interface %q: %w", interfaceName, err)
 	}
-	program := unix.SockFprog{Len: uint16(len(filter)), Filter: (*unix.SockFilter)(unsafe.Pointer(&filter[0]))}
-	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &program); err != nil {
-		return fail("attach packet filter", err)
+	if err := packet.SetBPF(filter); err != nil {
+		capture.Close()
+		return nil, fmt.Errorf("attach packet filter on interface %q: %w", interfaceName, err)
 	}
 	return capture, nil
 }
 
 func (c *linuxCapture) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
-	var fd int
-	for {
-		c.mu.Lock()
-		fd = c.fd
-		c.mu.Unlock()
-		if fd < 0 {
-			return nil, gopacket.CaptureInfo{}, net.ErrClosed
-		}
-		poll := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
-		ready, err := unix.Poll(poll, 500)
-		if err == unix.EINTR {
-			continue
-		}
-		if err != nil {
-			return nil, gopacket.CaptureInfo{}, err
-		}
-		if ready == 0 {
-			continue
-		}
-		if poll[0].Revents&unix.POLLNVAL != 0 {
-			return nil, gopacket.CaptureInfo{}, net.ErrClosed
-		}
-		if poll[0].Revents&unix.POLLIN != 0 {
-			break
-		}
+	c.mu.Lock()
+	packet := c.packet
+	c.mu.Unlock()
+	if packet == nil {
+		return nil, gopacket.CaptureInfo{}, net.ErrClosed
 	}
-	data := make([]byte, linuxCaptureBufferSize)
-	timespecSize := int(unsafe.Sizeof(unix.Timespec{}))
-	oob := make([]byte, unix.CmsgSpace(timespecSize))
-	n, oobn, _, _, err := unix.Recvmsg(fd, data, oob, 0)
-	if err != nil {
-		return nil, gopacket.CaptureInfo{}, err
-	}
-	timestamp := time.Now()
-	if parsed := packetTimestamp(oob[:oobn]); !parsed.IsZero() {
-		timestamp = parsed
-	}
-	return data[:n], gopacket.CaptureInfo{
-		Timestamp: timestamp, CaptureLength: n, Length: n, InterfaceIndex: c.interfaceIndex,
-	}, nil
+	return packet.ReadPacketData()
 }
 
 func (c *linuxCapture) LinkType() layers.LinkType { return layers.LinkTypeEthernet }
 
+func (c *linuxCapture) Stats() (captureStats, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.packet == nil {
+		return captureStats{}, net.ErrClosed
+	}
+	_, stats, err := c.packet.SocketStats()
+	if err != nil {
+		return captureStats{}, err
+	}
+	return captureStats{PacketsReceived: uint64(stats.Packets()), PacketsDropped: uint64(stats.Drops())}, nil
+}
+
 func (c *linuxCapture) Close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.fd >= 0 {
-		_ = unix.Close(c.fd)
-		c.fd = -1
+	if c.packet != nil {
+		c.packet.Close()
+		c.packet = nil
+	}
+	if c.promiscFD >= 0 {
+		_ = unix.Close(c.promiscFD)
+		c.promiscFD = -1
 	}
 }
 
@@ -133,27 +123,6 @@ func listCaptureDevices() ([]captureDevice, error) {
 		})
 	}
 	return devices, nil
-}
-
-func packetTimestamp(oob []byte) time.Time {
-	messages, err := unix.ParseSocketControlMessage(oob)
-	if err != nil {
-		return time.Time{}
-	}
-	for _, message := range messages {
-		if message.Header.Level != unix.SOL_SOCKET || message.Header.Type != unix.SCM_TIMESTAMPNS || len(message.Data) < int(unsafe.Sizeof(unix.Timespec{})) {
-			continue
-		}
-		timestamp := *(*unix.Timespec)(unsafe.Pointer(&message.Data[0]))
-		return time.Unix(timestamp.Sec, timestamp.Nsec)
-	}
-	return time.Time{}
-}
-
-func networkByteOrder(value uint16) uint16 {
-	var data [2]byte
-	binary.BigEndian.PutUint16(data[:], value)
-	return *(*uint16)(unsafe.Pointer(&data[0]))
 }
 
 type filterInstruction struct {
@@ -272,7 +241,9 @@ func addIPv4PortFilter(builder *filterBuilder, label string, networkOffset uint3
 func addIPv6PortFilter(builder *filterBuilder, label string, networkOffset uint32, port uint16) {
 	builder.label(label)
 	builder.add(bpf.LoadAbsolute{Off: networkOffset + 6, Size: 1})
-	builder.jumpIf(uint32(layers.IPProtocolTCP), label+"_source", "drop")
+	// Extension headers make the TCP offset variable. Let those packets reach
+	// the protocol decoder and apply the exact endpoint filter in user space.
+	builder.jumpIf(uint32(layers.IPProtocolTCP), label+"_source", "accept")
 	builder.label(label + "_source")
 	builder.add(bpf.LoadAbsolute{Off: networkOffset + 40, Size: 2})
 	builder.jumpIf(uint32(port), "accept", label+"_destination")

@@ -9,6 +9,8 @@ PgSniffer 是一个旁路 PostgreSQL 流量分析工具。它重组 TCP 流、�
 - 使用抓包时间戳进行实时流量和离线 PCAP 分析。
 - 支持 Simple Query、prepared statement、Bind、Execute、拆包、粘包和并发连接。
 - 统计调用量、错误量、未完成请求、平均、p95、p99、最大和总耗时。
+- 报告抓包丢包、截断包、TCP 缺口和中途开始的连接。
+- 按用户、数据库、应用和客户端分组，并统计命令标签、影响行数、SQLSTATE、错误级别和事务上下文。
 - 默认脱敏 SQL 字面量，并使用有界内存聚合。
 - 检测 TLS/GSS 加密连接并单独计数。
 
@@ -22,7 +24,7 @@ PgSniffer 是一个旁路 PostgreSQL 流量分析工具。它重组 TCP 流、�
 - macOS Apple Silicon
 - Windows x64
 
-Linux 安装包使用原生 `AF_PACKET`，不依赖外部运行库。macOS 使用系统自带的 libpcap，无需额外安装抓包库。Windows 仅在实时抓包和枚举网卡时需要安装 [Npcap](https://npcap.com/)；离线分析 PCAP/PCAPNG 不依赖 Npcap。
+Linux 安装包使用 `AF_PACKET`/`TPACKET_V3` 共享内存环形缓冲，不依赖外部运行库。macOS 使用系统自带的 libpcap，无需额外安装抓包库。Windows 仅在实时抓包和枚举网卡时需要安装 [Npcap](https://npcap.com/)；离线分析 PCAP/PCAPNG 不依赖 Npcap。
 
 ## 快速使用
 
@@ -58,9 +60,18 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
   "queries": [
     {
       "fingerprint": "select tablename from pg_catalog.pg_tables where schemaname = ? and tablename like ?",
+      "dimensions": {
+        "user": "app_user",
+        "database": "inventory",
+        "application_name": "catalog-api",
+        "client_address": "10.0.1.24"
+      },
       "calls": 57,
       "errors": 0,
       "incomplete": 0,
+      "rows_affected": 57,
+      "command_tags": {"SELECT": 57},
+      "transaction_status_before": {"idle": 57},
       "latency_ms": {
         "average": 11.643,
         "min": 1.433,
@@ -71,13 +82,26 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
       }
     }
   ],
+  "capture": {
+    "packets_seen": 920,
+    "packets_matched": 920,
+    "bytes_captured": 184320,
+    "truncated_packets": 0,
+    "kernel_packets_received": 920,
+    "kernel_packets_dropped": 0,
+    "interface_packets_dropped": 0,
+    "tcp_gap_events": 0,
+    "tcp_bytes_skipped": 0,
+    "midstream_connections": 0,
+    "statistics_errors": 0
+  },
   "encrypted_sessions": 0,
   "decode_errors": 0,
   "dropped_query_keys": 0
 }
 ```
 
-`incomplete` 表示连接在完整响应前关闭的请求数量；`dropped_query_keys` 表示达到有界聚合上限后被合并的新 SQL 指纹数量。
+`incomplete` 表示没有获得完整响应的请求数量。`incomplete_reasons` 会区分连接关闭、抓包结束或空闲超时、TCP 缺口、协议错误，以及流水线出错后被跳过的请求。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。`dropped_query_keys` 表示达到有界聚合上限后被合并的新“SQL 指纹与维度”组合数量。
 
 ## 耗时语义
 

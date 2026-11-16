@@ -100,3 +100,45 @@ func TestCollectorTruncatesVeryLongFingerprints(t *testing.T) {
 		t.Fatalf("long query was not bounded: fingerprint=%d example=%d", len(report.Queries[0].Fingerprint), len(report.Queries[0].Example))
 	}
 }
+
+func TestCollectorGroupsDimensionsAndReportsExecutionDetails(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.Add(Event{
+		Query: "UPDATE jobs SET done = true", Duration: 2 * time.Millisecond,
+		Metadata: Metadata{User: "worker", Database: "queue", ApplicationName: "scheduler", ClientAddress: "10.0.0.2"},
+		Commands: []Command{{Tag: "UPDATE", RowsAffected: 4}}, TransactionStatus: "idle",
+	})
+	collector.Add(Event{
+		Query: "UPDATE jobs SET done = true", Duration: 3 * time.Millisecond,
+		Metadata:  Metadata{User: "admin", Database: "queue", ApplicationName: "console", ClientAddress: "10.0.0.3"},
+		ErrorCode: "42501", ErrorInfo: "permission denied", Severity: "ERROR", TransactionStatus: "in_transaction",
+	})
+	collector.ObservePacket(100, 120, true)
+	collector.SetKernelCaptureStatistics(10, 2, 1)
+	collector.AddTCPGap(64)
+	collector.AddMidstreamConnection()
+
+	report := collector.Snapshot("count", 0)
+	if len(report.Queries) != 2 {
+		t.Fatalf("queries = %+v", report.Queries)
+	}
+	if report.Capture.PacketsSeen != 1 || report.Capture.PacketsMatched != 1 || report.Capture.TruncatedPackets != 1 ||
+		report.Capture.KernelPacketsDropped != 2 || report.Capture.InterfacePacketsDropped != 1 ||
+		report.Capture.TCPGapEvents != 1 || report.Capture.TCPBytesSkipped != 64 || report.Capture.MidstreamConnections != 1 {
+		t.Fatalf("capture = %+v", report.Capture)
+	}
+	for _, summary := range report.Queries {
+		switch summary.Dimensions.User {
+		case "worker":
+			if summary.RowsAffected != 4 || summary.CommandTags["UPDATE"] != 1 || summary.TransactionStatuses["idle"] != 1 {
+				t.Fatalf("worker summary = %+v", summary)
+			}
+		case "admin":
+			if summary.Errors != 1 || summary.SQLStates["42501"] != 1 || summary.Severities["ERROR"] != 1 || summary.TransactionStatuses["in_transaction"] != 1 {
+				t.Fatalf("admin summary = %+v", summary)
+			}
+		default:
+			t.Fatalf("unexpected dimensions: %+v", summary.Dimensions)
+		}
+	}
+}

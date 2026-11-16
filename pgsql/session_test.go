@@ -2,6 +2,7 @@ package pgsql
 
 import (
 	"encoding/binary"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -102,12 +103,136 @@ func TestSessionErrorResponse(t *testing.T) {
 	if err := session.Feed(ServerToClient, message('E', errorPayload), t0.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
+	if len(events) != 0 {
+		t.Fatalf("simple query finished before ReadyForQuery: %+v", events)
+	}
+	if err := session.Feed(ServerToClient, message('Z', []byte{'I'}), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
 
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
 	if events[0].ErrorCode != "42703" || events[0].ErrorInfo != "column does not exist" || events[0].Severity != "ERROR" {
 		t.Fatalf("error event = %+v", events[0])
+	}
+}
+
+func TestSessionPipelinedSimpleErrorDoesNotFinishNextQuery(t *testing.T) {
+	var events []Event
+	session := NewSession(1024, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(325, 0)
+	frontend := append(message('Q', cstring("SELECT 1 / 0")), message('Q', cstring("SELECT 2"))...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("22012")...)
+	errorPayload = append(errorPayload, 0)
+	firstResponse := append(message('E', errorPayload), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, firstResponse, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || events[0].Query != "SELECT 1 / 0" || events[0].ErrorCode != "22012" {
+		t.Fatalf("events after first response = %+v", events)
+	}
+	secondResponse := append(message('C', cstring("SELECT 1")), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, secondResponse, t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[1].Query != "SELECT 2" || events[1].ErrorCode != "" {
+		t.Fatalf("events after second response = %+v", events)
+	}
+}
+
+func TestSessionCapturesCommandRowsAndTransactionContext(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{ClientAddress: "10.0.0.2"}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(350, 0)
+	if err := session.Feed(ClientToServer, startupPacket(map[string]string{
+		"user": "alice", "application_name": "orders-api",
+	}), t0); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('Z', []byte{'I'}), t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ClientToServer, message('Q', cstring("UPDATE orders SET state = 'paid'; SELECT 1")), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	responses := append(message('C', cstring("UPDATE 3")), message('C', cstring("SELECT 1"))...)
+	responses = append(responses, message('Z', []byte{'T'})...)
+	if err := session.Feed(ServerToClient, responses, t0.Add(8*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+	event := events[0]
+	if event.Metadata.Database != "alice" || event.Metadata.ApplicationName != "orders-api" {
+		t.Fatalf("metadata = %+v", event.Metadata)
+	}
+	if event.TransactionStatus != "idle" {
+		t.Fatalf("transaction status = %q", event.TransactionStatus)
+	}
+	if len(event.Commands) != 2 || event.Commands[0] != (Command{Tag: "UPDATE", RowsAffected: 3}) || event.Commands[1] != (Command{Tag: "SELECT", RowsAffected: 1}) {
+		t.Fatalf("commands = %+v", event.Commands)
+	}
+
+	parameterStatus := append(cstring("application_name"), cstring("orders-worker")...)
+	if err := session.Feed(ServerToClient, message('S', parameterStatus), t0.Add(8*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ClientToServer, message('Q', cstring("ROLLBACK")), t0.Add(9*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('C', cstring("ROLLBACK")), t0.Add(10*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('Z', []byte{'I'}), t0.Add(11*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[1].TransactionStatus != "in_transaction" || events[1].Metadata.ApplicationName != "orders-worker" {
+		t.Fatalf("second event = %+v", events)
+	}
+}
+
+func TestSessionMarksTCPGapIncomplete(t *testing.T) {
+	var events []Event
+	session := NewSession(1024, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(375, 0)
+	if err := session.Feed(ClientToServer, message('Q', cstring("SELECT pg_sleep(1)")), t0); err != nil {
+		t.Fatal(err)
+	}
+	session.Gap(t0.Add(time.Millisecond))
+	if len(events) != 1 || !events[0].Incomplete || events[0].IncompleteReason != "tcp_gap" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionMarksSkippedPipelineQueriesAfterError(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(390, 0)
+	var frontend []byte
+	for index, query := range []string{"SELECT 1 / 0", "SELECT 2"} {
+		name := "statement_" + strconv.Itoa(index)
+		portal := "portal_" + strconv.Itoa(index)
+		frontend = append(frontend, message('P', append(append(cstring(name), cstring(query)...), 0, 0))...)
+		frontend = append(frontend, message('B', append(cstring(portal), cstring(name)...))...)
+		frontend = append(frontend, message('E', append(cstring(portal), 0, 0, 0, 0))...)
+	}
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	errorPayload := append([]byte{'C'}, cstring("22012")...)
+	errorPayload = append(errorPayload, 0)
+	backend := append(message('E', errorPayload), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[0].ErrorCode != "22012" || events[1].IncompleteReason != "aborted_after_error" {
+		t.Fatalf("events = %+v", events)
 	}
 }
 

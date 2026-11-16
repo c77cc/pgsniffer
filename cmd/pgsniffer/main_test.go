@@ -65,6 +65,12 @@ func TestRunCaptureOfflinePCAP(t *testing.T) {
 	if report.Queries[0].Fingerprint != "select ?" || report.Queries[0].Max != 20*time.Millisecond {
 		t.Fatalf("summary = %+v", report.Queries[0])
 	}
+	if report.Queries[0].CommandTags["SELECT"] != 1 || report.Queries[0].RowsAffected != 1 || report.Queries[0].Dimensions.ClientAddress != "10.0.0.2" {
+		t.Fatalf("query details = %+v", report.Queries[0])
+	}
+	if report.Capture.PacketsSeen != 2 || report.Capture.PacketsMatched != 2 || report.Capture.BytesCaptured == 0 || report.Capture.TruncatedPackets != 0 {
+		t.Fatalf("capture statistics = %+v", report.Capture)
+	}
 }
 
 func TestOpenOfflinePCAPNG(t *testing.T) {
@@ -172,7 +178,7 @@ func TestReassemblyCompleteUsesConnectionCloseTimestamp(t *testing.T) {
 		t.Fatal("stream should be removable after reassembly completes")
 	}
 	report := collector.Snapshot("max", 0)
-	if len(report.Queries) != 1 || report.Queries[0].Incomplete != 1 || report.Queries[0].Max != 250*time.Millisecond {
+	if len(report.Queries) != 1 || report.Queries[0].Incomplete != 1 || report.Queries[0].Max != 250*time.Millisecond || report.Queries[0].IncompleteReasons["connection_closed"] != 1 {
 		t.Fatalf("report = %+v", report)
 	}
 }

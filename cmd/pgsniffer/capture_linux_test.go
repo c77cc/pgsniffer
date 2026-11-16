@@ -30,12 +30,14 @@ func TestServerPortFilter(t *testing.T) {
 	response := tcpPacket(t, false, 200, []byte("response"))
 	ipv6Request := tcpIPv6Packet(t, true, []byte("request"))
 	ipv6Response := tcpIPv6Packet(t, false, []byte("response"))
+	ipv6ExtensionRequest := addIPv6HopByHopHeader(ipv6Request)
 	vlanRequest := addVLANHeader(request, 42)
 	for name, packet := range map[string][]byte{
 		"IPv4 destination port": request,
 		"IPv4 source port":      response,
 		"IPv6 destination port": ipv6Request,
 		"IPv6 source port":      ipv6Response,
+		"IPv6 extension header": ipv6ExtensionRequest,
 		"VLAN":                  vlanRequest,
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -68,6 +70,17 @@ func TestServerPortFilter(t *testing.T) {
 	if accepted != 0 {
 		t.Fatal("unrelated port was accepted")
 	}
+}
+
+func addIPv6HopByHopHeader(packet []byte) []byte {
+	const ipv6Offset = 14
+	result := make([]byte, 0, len(packet)+8)
+	result = append(result, packet[:ipv6Offset+40]...)
+	result[ipv6Offset+6] = byte(layers.IPProtocolIPv6HopByHop)
+	payloadLength := binary.BigEndian.Uint16(result[ipv6Offset+4 : ipv6Offset+6])
+	binary.BigEndian.PutUint16(result[ipv6Offset+4:ipv6Offset+6], payloadLength+8)
+	result = append(result, byte(layers.IPProtocolTCP), 0, 0, 0, 0, 0, 0, 0)
+	return append(result, packet[ipv6Offset+40:]...)
 }
 
 func tcpIPv6Packet(t *testing.T, clientToServer bool, payload []byte) []byte {

@@ -55,19 +55,45 @@ type dockerResource struct {
 }
 
 type report struct {
-	GeneratedAt       time.Time `json:"generated_at"`
-	Queries           []summary `json:"queries"`
-	EncryptedSessions uint64    `json:"encrypted_sessions"`
-	DecodeErrors      uint64    `json:"decode_errors"`
-	DroppedKeys       uint64    `json:"dropped_query_keys"`
+	GeneratedAt       time.Time         `json:"generated_at"`
+	Queries           []summary         `json:"queries"`
+	Capture           captureStatistics `json:"capture"`
+	EncryptedSessions uint64            `json:"encrypted_sessions"`
+	DecodeErrors      uint64            `json:"decode_errors"`
+	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+type captureStatistics struct {
+	PacketsSeen             uint64 `json:"packets_seen"`
+	PacketsMatched          uint64 `json:"packets_matched"`
+	TruncatedPackets        uint64 `json:"truncated_packets"`
+	KernelPacketsDropped    uint64 `json:"kernel_packets_dropped"`
+	InterfacePacketsDropped uint64 `json:"interface_packets_dropped"`
+	TCPGapEvents            uint64 `json:"tcp_gap_events"`
+	TCPBytesSkipped         uint64 `json:"tcp_bytes_skipped"`
+	StatisticsErrors        uint64 `json:"statistics_errors"`
+}
+
+type dimensions struct {
+	User            string `json:"user"`
+	Database        string `json:"database"`
+	ApplicationName string `json:"application_name"`
+	ClientAddress   string `json:"client_address"`
 }
 
 type summary struct {
-	Fingerprint string      `json:"fingerprint"`
-	Count       uint64      `json:"calls"`
-	Errors      uint64      `json:"errors"`
-	Incomplete  uint64      `json:"incomplete"`
-	Latency     latencyJSON `json:"latency_ms"`
+	Fingerprint         string            `json:"fingerprint"`
+	Dimensions          dimensions        `json:"dimensions"`
+	Count               uint64            `json:"calls"`
+	Errors              uint64            `json:"errors"`
+	Incomplete          uint64            `json:"incomplete"`
+	RowsAffected        uint64            `json:"rows_affected"`
+	CommandTags         map[string]uint64 `json:"command_tags"`
+	SQLStates           map[string]uint64 `json:"sqlstates"`
+	Severities          map[string]uint64 `json:"error_severities"`
+	TransactionStatuses map[string]uint64 `json:"transaction_status_before"`
+	IncompleteReasons   map[string]uint64 `json:"incomplete_reasons"`
+	Latency             latencyJSON       `json:"latency_ms"`
 }
 
 type latencyJSON struct {
@@ -254,6 +280,18 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 		pgsql.Fingerprint("SELECT upper('pipeline')"):                                                 {1, 0},
 	}
 	h.assertQueries(t, live, want)
+	selectSummary := findSummary(t, live, pgsql.Fingerprint("SELECT 42"))
+	if selectSummary.Dimensions.User != "postgres" || selectSummary.Dimensions.Database != "postgres" ||
+		selectSummary.Dimensions.ApplicationName != "pgsniffer-e2e" || selectSummary.Dimensions.ClientAddress != "127.0.0.1" {
+		t.Fatalf("unexpected query dimensions: %+v", selectSummary.Dimensions)
+	}
+	if selectSummary.CommandTags["SELECT"] != 1 || selectSummary.RowsAffected != 1 || selectSummary.TransactionStatuses["idle"] != 1 {
+		t.Fatalf("unexpected command details: %+v", selectSummary)
+	}
+	errorSummary := findSummary(t, live, pgsql.Fingerprint("SELECT 1 / 0"))
+	if errorSummary.SQLStates["22012"] != 1 || errorSummary.Severities["ERROR"] != 1 {
+		t.Fatalf("unexpected SQLSTATE details: %+v", errorSummary)
+	}
 
 	offline := h.replay(t, cap.pcapPath, port, "plain-replay.json")
 	h.assertReportsEqual(t, live, offline)
@@ -292,6 +330,9 @@ func (h *harness) testInterruption(t *testing.T) {
 	fingerprint := pgsql.Fingerprint("SELECT pg_sleep(10)")
 	if len(live.Queries) != 1 || live.Queries[0].Fingerprint != fingerprint || live.Queries[0].Incomplete != 1 {
 		t.Fatalf("unexpected interrupted report: %+v", live)
+	}
+	if live.Queries[0].IncompleteReasons["connection_closed"] != 1 {
+		t.Fatalf("unexpected interruption reason: %+v", live.Queries[0].IncompleteReasons)
 	}
 	if live.Queries[0].Latency.Max < 200 {
 		t.Fatalf("interrupted duration is too short: %.3fms", live.Queries[0].Latency.Max)
@@ -563,6 +604,22 @@ func (h *harness) assertHealthy(t *testing.T, got report) {
 	if got.DecodeErrors != 0 || got.DroppedKeys != 0 || got.EncryptedSessions != 0 {
 		t.Fatalf("unhealthy report: %+v", got)
 	}
+	if got.Capture.PacketsSeen == 0 || got.Capture.PacketsMatched == 0 || got.Capture.TruncatedPackets != 0 ||
+		got.Capture.KernelPacketsDropped != 0 || got.Capture.InterfacePacketsDropped != 0 ||
+		got.Capture.TCPGapEvents != 0 || got.Capture.TCPBytesSkipped != 0 || got.Capture.StatisticsErrors != 0 {
+		t.Fatalf("unhealthy capture statistics: %+v", got.Capture)
+	}
+}
+
+func findSummary(t *testing.T, report report, fingerprint string) summary {
+	t.Helper()
+	for _, query := range report.Queries {
+		if query.Fingerprint == fingerprint {
+			return query
+		}
+	}
+	t.Fatalf("summary %q not found in %+v", fingerprint, report.Queries)
+	return summary{}
 }
 
 func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct{ count, errors uint64 }) {
@@ -589,6 +646,8 @@ func (h *harness) assertReportsEqual(t *testing.T, live, offline report) {
 	t.Helper()
 	live.GeneratedAt = time.Time{}
 	offline.GeneratedAt = time.Time{}
+	live.Capture = captureStatistics{}
+	offline.Capture = captureStatistics{}
 	sort.Slice(live.Queries, func(i, j int) bool { return live.Queries[i].Fingerprint < live.Queries[j].Fingerprint })
 	sort.Slice(offline.Queries, func(i, j int) bool { return offline.Queries[i].Fingerprint < offline.Queries[j].Fingerprint })
 	liveTimes := stripReportLatencies(&live)

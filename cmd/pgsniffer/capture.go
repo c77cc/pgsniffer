@@ -16,7 +16,14 @@ import (
 type captureHandle interface {
 	gopacket.PacketDataSource
 	LinkType() layers.LinkType
+	Stats() (captureStats, error)
 	Close()
+}
+
+type captureStats struct {
+	PacketsReceived  uint64
+	PacketsDropped   uint64
+	InterfaceDropped uint64
 }
 
 type captureDevice struct {
@@ -36,6 +43,8 @@ func (c *offlineCapture) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) 
 }
 
 func (c *offlineCapture) LinkType() layers.LinkType { return c.linkType }
+
+func (c *offlineCapture) Stats() (captureStats, error) { return captureStats{}, nil }
 
 func (c *offlineCapture) Close() { _ = c.file.Close() }
 

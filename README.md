@@ -9,6 +9,8 @@ PgSniffer passively analyzes PostgreSQL traffic. It reassembles TCP streams, und
 - Live capture and offline PCAP analysis using packet timestamps.
 - Simple Query, prepared statement, Bind, Execute, split-packet, and concurrent connection tracking.
 - Call, error, incomplete-request, average, p95, p99, maximum, and total latency statistics.
+- Capture-loss, truncation, TCP-gap, and midstream-connection diagnostics.
+- Per-user, database, application, and client grouping with command tags, affected rows, SQLSTATE, severity, and transaction context.
 - SQL literal redaction and bounded in-memory aggregation by default.
 - Explicit detection of TLS/GSS encrypted sessions.
 
@@ -22,7 +24,7 @@ Prebuilt packages and SHA-256 checksums are available on [GitHub Releases](https
 - macOS Apple Silicon
 - Windows x64
 
-Linux packages are self-contained and use the native `AF_PACKET` interface. macOS uses the system-provided libpcap and requires no additional capture library. Windows requires [Npcap](https://npcap.com/) only for live capture and interface listing; offline PCAP/PCAPNG analysis has no Npcap dependency.
+Linux packages are self-contained and use an `AF_PACKET`/`TPACKET_V3` shared-memory ring. macOS uses the system-provided libpcap and requires no additional capture library. Windows requires [Npcap](https://npcap.com/) only for live capture and interface listing; offline PCAP/PCAPNG analysis has no Npcap dependency.
 
 ## Quick start
 
@@ -58,9 +60,18 @@ Durations are reported in milliseconds:
   "queries": [
     {
       "fingerprint": "select tablename from pg_catalog.pg_tables where schemaname = ? and tablename like ?",
+      "dimensions": {
+        "user": "app_user",
+        "database": "inventory",
+        "application_name": "catalog-api",
+        "client_address": "10.0.1.24"
+      },
       "calls": 57,
       "errors": 0,
       "incomplete": 0,
+      "rows_affected": 57,
+      "command_tags": {"SELECT": 57},
+      "transaction_status_before": {"idle": 57},
       "latency_ms": {
         "average": 11.643,
         "min": 1.433,
@@ -71,13 +82,26 @@ Durations are reported in milliseconds:
       }
     }
   ],
+  "capture": {
+    "packets_seen": 920,
+    "packets_matched": 920,
+    "bytes_captured": 184320,
+    "truncated_packets": 0,
+    "kernel_packets_received": 920,
+    "kernel_packets_dropped": 0,
+    "interface_packets_dropped": 0,
+    "tcp_gap_events": 0,
+    "tcp_bytes_skipped": 0,
+    "midstream_connections": 0,
+    "statistics_errors": 0
+  },
   "encrypted_sessions": 0,
   "decode_errors": 0,
   "dropped_query_keys": 0
 }
 ```
 
-`incomplete` counts requests whose connection closed before a complete response. `dropped_query_keys` counts new fingerprints merged after the bounded aggregation limit was reached.
+`incomplete` counts requests without a complete response. `incomplete_reasons` distinguishes connection closure, capture/idle timeout, TCP gaps, protocol errors, and pipeline requests skipped after an error. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete. `dropped_query_keys` counts new fingerprint-and-dimension groups merged after the bounded aggregation limit was reached.
 
 ## Timing semantics
 

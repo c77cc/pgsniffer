@@ -58,6 +58,8 @@ type pgStream struct {
 	verbose       bool
 	showValues    bool
 	lastSeen      time.Time
+	sawTCPClose   bool
+	sawMidstream  bool
 }
 
 func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reassembly.AssemblerContext) reassembly.Stream {
@@ -71,11 +73,13 @@ func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reass
 		firstIsClient = false
 	}
 
-	clientIP, clientPort := netFlow.Src().String(), tcp.SrcPort.String()
+	clientIP, clientPort := netFlow.Src().String(), tcp.SrcPort
 	if !firstIsClient {
-		clientIP, clientPort = netFlow.Dst().String(), tcp.DstPort.String()
+		clientIP, clientPort = netFlow.Dst().String(), tcp.DstPort
 	}
-	metadata := pgsql.Metadata{Client: net.JoinHostPort(clientIP, clientPort)}
+	metadata := pgsql.Metadata{
+		Client: net.JoinHostPort(clientIP, clientPort.String()), ClientAddress: clientIP, ClientPort: uint16(clientPort),
+	}
 
 	stream := &pgStream{
 		collector: f.collector, firstIsClient: firstIsClient,
@@ -103,9 +107,12 @@ func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reass
 	return stream
 }
 
-func (s *pgStream) Accept(_ *layers.TCP, info gopacket.CaptureInfo, _ reassembly.TCPFlowDirection, _ reassembly.Sequence, start *bool, _ reassembly.AssemblerContext) bool {
+func (s *pgStream) Accept(tcp *layers.TCP, info gopacket.CaptureInfo, _ reassembly.TCPFlowDirection, _ reassembly.Sequence, start *bool, _ reassembly.AssemblerContext) bool {
 	// Passive capture commonly starts after the TCP handshake.
 	*start = true
+	if tcp.FIN || tcp.RST {
+		s.sawTCPClose = true
+	}
 	if info.Timestamp.After(s.lastSeen) {
 		s.lastSeen = info.Timestamp
 	}
@@ -122,9 +129,17 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	if info.Timestamp.After(s.lastSeen) {
 		s.lastSeen = info.Timestamp
 	}
-	direction, _, _, skip := sg.Info()
-	if skip != 0 {
+	direction, _, end, skip := sg.Info()
+	if end {
+		s.sawTCPClose = true
+	}
+	if skip > 0 {
+		s.collector.AddTCPGap(skip)
 		s.collector.AddDecodeError()
+		s.session.Gap(info.Timestamp)
+	} else if skip < 0 && !s.sawMidstream {
+		s.sawMidstream = true
+		s.collector.AddMidstreamConnection()
 	}
 
 	clientToServer := direction == reassembly.TCPDirClientToServer
@@ -137,6 +152,7 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	}
 	if err := s.session.Feed(pgDirection, data, info.Timestamp); err != nil {
 		s.collector.AddDecodeError()
+		s.session.Abort(info.Timestamp)
 		if s.verbose {
 			log.Printf("discarding malformed PostgreSQL stream data: %v", err)
 		}
@@ -154,7 +170,11 @@ func (s *pgStream) ReassemblyComplete(ac reassembly.AssemblerContext) bool {
 	if at.IsZero() {
 		at = time.Now()
 	}
-	s.session.Close(at)
+	reason := "capture_or_idle_timeout"
+	if s.sawTCPClose {
+		reason = "connection_closed"
+	}
+	s.session.CloseWithReason(at, reason)
 	return true
 }
 
@@ -265,6 +285,14 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 		return err
 	}
 	defer handle.Close()
+	defer func() {
+		stats, statsErr := handle.Stats()
+		if statsErr != nil {
+			collector.AddCaptureStatisticsError()
+			return
+		}
+		collector.SetKernelCaptureStatistics(stats.PacketsReceived, stats.PacketsDropped, stats.InterfaceDropped)
+	}()
 
 	factory := &pgStreamFactory{
 		serverIP: server.Addr().String(), serverPort: layers.TCPPort(server.Port()), collector: collector,
@@ -300,17 +328,24 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 				collector.AddDecodeError()
 				continue
 			}
+			if packet.ErrorLayer() != nil {
+				collector.AddDecodeError()
+			}
 			latestCaptureTime = metadata.Timestamp
 			network := packet.NetworkLayer()
 			tcpLayer := packet.Layer(layers.LayerTypeTCP)
 			if network == nil || tcpLayer == nil {
+				collector.ObservePacket(metadata.CaptureLength, metadata.Length, false)
 				continue
 			}
 			tcp, ok := tcpLayer.(*layers.TCP)
 			if !ok {
+				collector.ObservePacket(metadata.CaptureLength, metadata.Length, false)
 				continue
 			}
-			if !packetMatchesServer(network, tcp, server) {
+			matched := packetMatchesServer(network, tcp, server)
+			collector.ObservePacket(metadata.CaptureLength, metadata.Length, matched)
+			if !matched {
 				continue
 			}
 			assembler.AssembleWithContext(network.NetworkFlow(), tcp, captureContext{info: metadata.CaptureInfo})

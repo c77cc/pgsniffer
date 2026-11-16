@@ -4,6 +4,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,20 +40,31 @@ type Metadata struct {
 	Database        string `json:"database,omitempty"`
 	ApplicationName string `json:"application_name,omitempty"`
 	Client          string `json:"client,omitempty"`
+	ClientAddress   string `json:"client_address,omitempty"`
+	ClientPort      uint16 `json:"client_port,omitempty"`
+}
+
+// Command describes one CommandComplete response associated with a query.
+type Command struct {
+	Tag          string `json:"tag"`
+	RowsAffected uint64 `json:"rows_affected,omitempty"`
 }
 
 // Event is one completed query observed on the wire.
 type Event struct {
-	Query      string        `json:"query"`
-	StartedAt  time.Time     `json:"started_at"`
-	FinishedAt time.Time     `json:"finished_at"`
-	Duration   time.Duration `json:"duration"`
-	ErrorCode  string        `json:"error_code,omitempty"`
-	ErrorInfo  string        `json:"error,omitempty"`
-	Severity   string        `json:"severity,omitempty"`
-	Metadata   Metadata      `json:"metadata"`
-	Encrypted  bool          `json:"encrypted,omitempty"`
-	Incomplete bool          `json:"incomplete,omitempty"`
+	Query             string        `json:"query"`
+	StartedAt         time.Time     `json:"started_at"`
+	FinishedAt        time.Time     `json:"finished_at"`
+	Duration          time.Duration `json:"duration"`
+	ErrorCode         string        `json:"error_code,omitempty"`
+	ErrorInfo         string        `json:"error,omitempty"`
+	Severity          string        `json:"severity,omitempty"`
+	Metadata          Metadata      `json:"metadata"`
+	Commands          []Command     `json:"commands,omitempty"`
+	TransactionStatus string        `json:"transaction_status_before,omitempty"`
+	Encrypted         bool          `json:"encrypted,omitempty"`
+	Incomplete        bool          `json:"incomplete,omitempty"`
+	IncompleteReason  string        `json:"incomplete_reason,omitempty"`
 }
 
 type timedBuffer struct {
@@ -64,10 +77,16 @@ type portal struct {
 }
 
 type pendingRequest struct {
-	query     string
-	startedAt time.Time
-	metadata  Metadata
-	simple    bool
+	query             string
+	startedAt         time.Time
+	metadata          Metadata
+	simple            bool
+	commands          []Command
+	transactionStatus string
+	syncGroup         uint64
+	errorCode         string
+	errorInfo         string
+	severity          string
 }
 
 // Session incrementally decodes both halves of one PostgreSQL TCP connection.
@@ -87,9 +106,13 @@ type Session struct {
 	encrypted        bool
 	encryptedEmitted bool
 
-	statements map[string]string
-	portals    map[string]portal
-	pending    []pendingRequest
+	statements        map[string]string
+	portals           map[string]portal
+	pending           []pendingRequest
+	transactionStatus string
+	frontendSyncGroup uint64
+	backendSyncGroup  uint64
+	extendedError     bool
 }
 
 func NewSession(maxFrameSize int, metadata Metadata, emit func(Event)) *Session {
@@ -267,6 +290,9 @@ func (s *Session) parseStartupParameters(payload []byte) {
 			s.metadata.ApplicationName = values[i+1]
 		}
 	}
+	if s.metadata.Database == "" {
+		s.metadata.Database = s.metadata.User
+	}
 }
 
 func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
@@ -276,6 +302,7 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 		if ok && query != "" {
 			s.appendPending(pendingRequest{
 				query: query, startedAt: at, metadata: s.metadata, simple: true,
+				transactionStatus: s.transactionStatus,
 			})
 		}
 	case 'P':
@@ -311,8 +338,11 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 		if bound, found := s.portals[portalName]; found && bound.query != "" {
 			s.appendPending(pendingRequest{
 				query: bound.query, startedAt: at, metadata: s.metadata,
+				transactionStatus: s.transactionStatus, syncGroup: s.frontendSyncGroup,
 			})
 		}
+	case 'S':
+		s.frontendSyncGroup++
 	case 'C':
 		if len(payload) < 2 {
 			return
@@ -327,43 +357,90 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 			delete(s.portals, name)
 		}
 	case 'X':
-		s.finishAll(at, true)
+		s.finishAll(at, "client_terminated")
 	}
 }
 
 func (s *Session) appendPending(request pendingRequest) {
 	if len(s.pending) >= maxPendingRequests {
-		s.finishFirst(request.startedAt, "", "", "", true)
+		s.finishFirst(request.startedAt, "", "", "", "pending_limit")
 	}
 	s.pending = append(s.pending, request)
 }
 
 func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 	switch typ {
-	case 'C', 's': // CommandComplete or PortalSuspended
+	case 'S': // ParameterStatus can change application/session identity.
+		name, rest, ok := readCString(payload)
+		if !ok {
+			return
+		}
+		value, _, ok := readCString(rest)
+		if !ok {
+			return
+		}
+		switch name {
+		case "application_name":
+			s.metadata.ApplicationName = value
+		case "session_authorization":
+			s.metadata.User = value
+		}
+	case 'C': // CommandComplete
+		if len(s.pending) > 0 {
+			s.pending[0].commands = append(s.pending[0].commands, parseCommand(payload))
+		}
 		if len(s.pending) > 0 && !s.pending[0].simple {
-			s.finishFirst(at, "", "", "", false)
+			s.finishFirst(at, "", "", "", "")
+		}
+	case 's': // PortalSuspended completes this Execute, but not the portal.
+		if len(s.pending) > 0 && !s.pending[0].simple {
+			s.pending[0].commands = append(s.pending[0].commands, Command{Tag: "PORTAL SUSPENDED"})
+			s.finishFirst(at, "", "", "", "")
 		}
 	case 'E':
 		code, message, severity := parseError(payload)
-		s.finishFirst(at, code, message, severity, false)
+		if len(s.pending) > 0 && s.pending[0].simple {
+			s.pending[0].errorCode = code
+			s.pending[0].errorInfo = message
+			s.pending[0].severity = severity
+			break
+		}
+		if len(s.pending) > 0 {
+			s.extendedError = true
+		}
+		s.finishFirst(at, code, message, severity, "")
 	case 'I': // EmptyQueryResponse
 		if len(s.pending) > 0 && !s.pending[0].simple {
-			s.finishFirst(at, "", "", "", false)
+			s.finishFirst(at, "", "", "", "")
 		}
 	case 'Z': // ReadyForQuery is the boundary for one Simple Query message.
-		if len(s.pending) > 0 {
-			s.finishFirst(at, "", "", "", false)
+		if len(s.pending) > 0 && s.pending[0].simple {
+			s.finishFirst(at, "", "", "", "")
+		}
+		if s.backendSyncGroup < s.frontendSyncGroup {
+			if s.extendedError {
+				for len(s.pending) > 0 && !s.pending[0].simple && s.pending[0].syncGroup == s.backendSyncGroup {
+					s.finishFirst(at, "", "", "", "aborted_after_error")
+				}
+				s.extendedError = false
+			}
+			s.backendSyncGroup++
+		}
+		if len(payload) > 0 {
+			s.transactionStatus = transactionStatusName(payload[0])
 		}
 	}
 }
 
-func (s *Session) finishFirst(at time.Time, code, message, severity string, incomplete bool) {
+func (s *Session) finishFirst(at time.Time, code, message, severity, incompleteReason string) {
 	if len(s.pending) == 0 {
 		return
 	}
 	pending := s.pending[0]
 	s.pending = s.pending[1:]
+	if code == "" && message == "" && severity == "" {
+		code, message, severity = pending.errorCode, pending.errorInfo, pending.severity
+	}
 	duration := at.Sub(pending.startedAt)
 	if duration < 0 {
 		duration = 0
@@ -371,13 +448,15 @@ func (s *Session) finishFirst(at time.Time, code, message, severity string, inco
 	s.emit(Event{
 		Query: pending.query, StartedAt: pending.startedAt, FinishedAt: at,
 		Duration: duration, ErrorCode: code, ErrorInfo: message,
-		Severity: severity, Metadata: pending.metadata, Incomplete: incomplete,
+		Severity: severity, Metadata: pending.metadata, Commands: pending.commands,
+		TransactionStatus: pending.transactionStatus,
+		Incomplete:        incompleteReason != "", IncompleteReason: incompleteReason,
 	})
 }
 
-func (s *Session) finishAll(at time.Time, incomplete bool) {
+func (s *Session) finishAll(at time.Time, incompleteReason string) {
 	for len(s.pending) > 0 {
-		s.finishFirst(at, "", "", "", incomplete)
+		s.finishFirst(at, "", "", "", incompleteReason)
 	}
 }
 
@@ -389,11 +468,74 @@ func (s *Session) emitEncrypted(at time.Time) {
 	s.emit(Event{FinishedAt: at, Metadata: s.metadata, Encrypted: true})
 }
 
-// Close reports requests that were still in flight when reassembly ended.
-func (s *Session) Close(at time.Time) {
+// Gap records that TCP reassembly skipped bytes and resets buffered protocol
+// fragments so an affected request is never reported as complete.
+func (s *Session) Gap(at time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.finishAll(at, true)
+	s.finishAll(at, "tcp_gap")
+	s.client = timedBuffer{}
+	s.server = timedBuffer{}
+}
+
+// Abort reports pending requests as incomplete after malformed protocol data.
+func (s *Session) Abort(at time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishAll(at, "protocol_error")
+	s.client = timedBuffer{}
+	s.server = timedBuffer{}
+}
+
+// Close reports requests that were still in flight when reassembly ended.
+func (s *Session) Close(at time.Time) {
+	s.CloseWithReason(at, "connection_closed")
+}
+
+func (s *Session) CloseWithReason(at time.Time, reason string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.finishAll(at, reason)
+}
+
+func parseCommand(payload []byte) Command {
+	value, _, ok := readCString(payload)
+	if !ok {
+		value = string(payload)
+	}
+	fields := strings.Fields(value)
+	if len(fields) == 0 {
+		return Command{}
+	}
+	command := Command{Tag: strings.ToUpper(value)}
+	baseTag := strings.ToUpper(fields[0])
+	if rows, err := strconv.ParseUint(fields[len(fields)-1], 10, 64); err == nil && commandHasRowCount(baseTag) {
+		command.Tag = baseTag
+		command.RowsAffected = rows
+	}
+	return command
+}
+
+func commandHasRowCount(tag string) bool {
+	switch tag {
+	case "SELECT", "INSERT", "UPDATE", "DELETE", "MERGE", "MOVE", "FETCH", "COPY":
+		return true
+	default:
+		return false
+	}
+}
+
+func transactionStatusName(status byte) string {
+	switch status {
+	case 'I':
+		return "idle"
+	case 'T':
+		return "in_transaction"
+	case 'E':
+		return "failed_transaction"
+	default:
+		return "unknown"
+	}
 }
 
 func readCString(data []byte) (value string, rest []byte, ok bool) {

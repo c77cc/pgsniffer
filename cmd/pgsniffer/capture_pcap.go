@@ -27,7 +27,20 @@ func openLiveCapture(interfaceName string, server netip.AddrPort) (captureHandle
 		handle.Close()
 		return nil, fmt.Errorf("set BPF filter %q: %w", filter, err)
 	}
-	return handle, nil
+	return &pcapCapture{Handle: handle}, nil
+}
+
+type pcapCapture struct{ *pcap.Handle }
+
+func (c *pcapCapture) Stats() (captureStats, error) {
+	stats, err := c.Handle.Stats()
+	if err != nil {
+		return captureStats{}, err
+	}
+	return captureStats{
+		PacketsReceived: uint64(stats.PacketsReceived), PacketsDropped: uint64(stats.PacketsDropped),
+		InterfaceDropped: uint64(stats.PacketsIfDropped),
+	}, nil
 }
 
 func listCaptureDevices() ([]captureDevice, error) {

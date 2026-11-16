@@ -51,30 +51,52 @@ func (h latencyHistogram) quantile(q float64, count uint64) time.Duration {
 }
 
 type queryStats struct {
-	fingerprint string
-	example     string
-	count       uint64
-	errors      uint64
-	incomplete  uint64
-	total       time.Duration
-	min         time.Duration
-	max         time.Duration
-	histogram   latencyHistogram
+	fingerprint         string
+	example             string
+	dimensions          Metadata
+	count               uint64
+	errors              uint64
+	incomplete          uint64
+	rowsAffected        uint64
+	total               time.Duration
+	min                 time.Duration
+	max                 time.Duration
+	histogram           latencyHistogram
+	commandTags         map[string]uint64
+	sqlstates           map[string]uint64
+	severities          map[string]uint64
+	transactionStatuses map[string]uint64
+	incompleteReasons   map[string]uint64
+}
+
+type queryKey struct {
+	fingerprint     string
+	user            string
+	database        string
+	applicationName string
+	clientAddress   string
 }
 
 // Summary is an immutable statistics snapshot suitable for table or JSON output.
 type Summary struct {
-	Fingerprint string
-	Example     string
-	Count       uint64
-	Errors      uint64
-	Incomplete  uint64
-	Average     time.Duration
-	Min         time.Duration
-	Max         time.Duration
-	P95         time.Duration
-	P99         time.Duration
-	Total       time.Duration
+	Fingerprint         string
+	Example             string
+	Dimensions          Metadata
+	Count               uint64
+	Errors              uint64
+	Incomplete          uint64
+	RowsAffected        uint64
+	CommandTags         map[string]uint64
+	SQLStates           map[string]uint64
+	Severities          map[string]uint64
+	TransactionStatuses map[string]uint64
+	IncompleteReasons   map[string]uint64
+	Average             time.Duration
+	Min                 time.Duration
+	Max                 time.Duration
+	P95                 time.Duration
+	P99                 time.Duration
+	Total               time.Duration
 }
 
 type latencyMilliseconds struct {
@@ -87,18 +109,27 @@ type latencyMilliseconds struct {
 }
 
 type summaryJSON struct {
-	Fingerprint string              `json:"fingerprint"`
-	Example     string              `json:"example,omitempty"`
-	Calls       uint64              `json:"calls"`
-	Errors      uint64              `json:"errors"`
-	Incomplete  uint64              `json:"incomplete"`
-	Latency     latencyMilliseconds `json:"latency_ms"`
+	Fingerprint         string              `json:"fingerprint"`
+	Example             string              `json:"example,omitempty"`
+	Dimensions          Metadata            `json:"dimensions,omitempty"`
+	Calls               uint64              `json:"calls"`
+	Errors              uint64              `json:"errors"`
+	Incomplete          uint64              `json:"incomplete"`
+	RowsAffected        uint64              `json:"rows_affected"`
+	CommandTags         map[string]uint64   `json:"command_tags,omitempty"`
+	SQLStates           map[string]uint64   `json:"sqlstates,omitempty"`
+	Severities          map[string]uint64   `json:"error_severities,omitempty"`
+	TransactionStatuses map[string]uint64   `json:"transaction_status_before,omitempty"`
+	IncompleteReasons   map[string]uint64   `json:"incomplete_reasons,omitempty"`
+	Latency             latencyMilliseconds `json:"latency_ms"`
 }
 
 func (s Summary) MarshalJSON() ([]byte, error) {
 	return json.Marshal(summaryJSON{
-		Fingerprint: s.Fingerprint, Example: s.Example, Calls: s.Count,
-		Errors: s.Errors, Incomplete: s.Incomplete,
+		Fingerprint: s.Fingerprint, Example: s.Example, Dimensions: s.Dimensions, Calls: s.Count,
+		Errors: s.Errors, Incomplete: s.Incomplete, RowsAffected: s.RowsAffected,
+		CommandTags: s.CommandTags, SQLStates: s.SQLStates, Severities: s.Severities,
+		TransactionStatuses: s.TransactionStatuses, IncompleteReasons: s.IncompleteReasons,
 		Latency: latencyMilliseconds{
 			Average: durationMilliseconds(s.Average), Min: durationMilliseconds(s.Min),
 			P95: durationMilliseconds(s.P95), P99: durationMilliseconds(s.P99),
@@ -113,8 +144,10 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	*s = Summary{
-		Fingerprint: value.Fingerprint, Example: value.Example, Count: value.Calls,
-		Errors: value.Errors, Incomplete: value.Incomplete,
+		Fingerprint: value.Fingerprint, Example: value.Example, Dimensions: value.Dimensions, Count: value.Calls,
+		Errors: value.Errors, Incomplete: value.Incomplete, RowsAffected: value.RowsAffected,
+		CommandTags: value.CommandTags, SQLStates: value.SQLStates, Severities: value.Severities,
+		TransactionStatuses: value.TransactionStatuses, IncompleteReasons: value.IncompleteReasons,
 		Average: millisecondsDuration(value.Latency.Average), Min: millisecondsDuration(value.Latency.Min),
 		P95: millisecondsDuration(value.Latency.P95), P99: millisecondsDuration(value.Latency.P99),
 		Max: millisecondsDuration(value.Latency.Max), Total: millisecondsDuration(value.Latency.Total),
@@ -132,11 +165,28 @@ func millisecondsDuration(milliseconds float64) time.Duration {
 }
 
 type Report struct {
-	GeneratedAt       time.Time `json:"generated_at"`
-	Queries           []Summary `json:"queries"`
-	EncryptedSessions uint64    `json:"encrypted_sessions"`
-	DecodeErrors      uint64    `json:"decode_errors"`
-	DroppedKeys       uint64    `json:"dropped_query_keys"`
+	GeneratedAt       time.Time         `json:"generated_at"`
+	Queries           []Summary         `json:"queries"`
+	Capture           CaptureStatistics `json:"capture"`
+	EncryptedSessions uint64            `json:"encrypted_sessions"`
+	DecodeErrors      uint64            `json:"decode_errors"`
+	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+// CaptureStatistics exposes whether packet loss or stream gaps can affect the
+// completeness of a report.
+type CaptureStatistics struct {
+	PacketsSeen             uint64 `json:"packets_seen"`
+	PacketsMatched          uint64 `json:"packets_matched"`
+	BytesCaptured           uint64 `json:"bytes_captured"`
+	TruncatedPackets        uint64 `json:"truncated_packets"`
+	KernelPacketsReceived   uint64 `json:"kernel_packets_received"`
+	KernelPacketsDropped    uint64 `json:"kernel_packets_dropped"`
+	InterfacePacketsDropped uint64 `json:"interface_packets_dropped"`
+	TCPGapEvents            uint64 `json:"tcp_gap_events"`
+	TCPBytesSkipped         uint64 `json:"tcp_bytes_skipped"`
+	MidstreamConnections    uint64 `json:"midstream_connections"`
+	StatisticsErrors        uint64 `json:"statistics_errors"`
 }
 
 // Collector keeps bounded aggregate state. It never stores individual latency
@@ -144,13 +194,14 @@ type Report struct {
 type Collector struct {
 	mu sync.RWMutex
 
-	queries      map[string]*queryStats
+	queries      map[queryKey]*queryStats
 	maxQueries   int
 	showExamples bool
 
 	encryptedSessions uint64
 	decodeErrors      uint64
 	droppedKeys       uint64
+	capture           CaptureStatistics
 }
 
 func NewCollector(maxQueries int, showExamples bool) *Collector {
@@ -158,7 +209,7 @@ func NewCollector(maxQueries int, showExamples bool) *Collector {
 		maxQueries = 10000
 	}
 	return &Collector{
-		queries: make(map[string]*queryStats), maxQueries: maxQueries,
+		queries: make(map[queryKey]*queryStats), maxQueries: maxQueries,
 		showExamples: showExamples,
 	}
 }
@@ -187,22 +238,32 @@ func (c *Collector) Add(event Event) {
 	if fingerprint == "" {
 		return
 	}
-	stats, found := c.queries[fingerprint]
+	dimensions := aggregateDimensions(event.Metadata)
+	key := queryKey{
+		fingerprint: fingerprint, user: dimensions.User, database: dimensions.Database,
+		applicationName: dimensions.ApplicationName, clientAddress: dimensions.ClientAddress,
+	}
+	stats, found := c.queries[key]
 	if !found {
 		if len(c.queries) >= c.maxQueries {
 			c.droppedKeys++
-			fingerprint = "[other fingerprints]"
-			stats = c.queries[fingerprint]
+			key = queryKey{fingerprint: "[other fingerprints]"}
+			stats = c.queries[key]
 		}
 		if stats == nil {
-			stats = &queryStats{fingerprint: fingerprint}
-			if c.showExamples && fingerprint != "[other fingerprints]" {
+			stats = &queryStats{
+				fingerprint: key.fingerprint, dimensions: dimensions,
+				commandTags: make(map[string]uint64), sqlstates: make(map[string]uint64),
+				severities: make(map[string]uint64), transactionStatuses: make(map[string]uint64),
+				incompleteReasons: make(map[string]uint64),
+			}
+			if c.showExamples && key.fingerprint != "[other fingerprints]" {
 				stats.example = query
 				if truncated {
 					stats.example += " …[truncated]"
 				}
 			}
-			c.queries[fingerprint] = stats
+			c.queries[key] = stats
 		}
 	}
 
@@ -217,15 +278,84 @@ func (c *Collector) Add(event Event) {
 	if event.ErrorCode != "" || event.ErrorInfo != "" {
 		stats.errors++
 	}
+	if event.ErrorCode != "" {
+		stats.sqlstates[event.ErrorCode]++
+	}
+	if event.Severity != "" {
+		stats.severities[event.Severity]++
+	}
 	if event.Incomplete {
 		stats.incomplete++
 	}
+	if event.IncompleteReason != "" {
+		stats.incompleteReasons[event.IncompleteReason]++
+	}
+	if event.TransactionStatus != "" {
+		stats.transactionStatuses[event.TransactionStatus]++
+	}
+	for _, command := range event.Commands {
+		if command.Tag != "" {
+			stats.commandTags[command.Tag]++
+		}
+		stats.rowsAffected += command.RowsAffected
+	}
 	stats.histogram.add(event.Duration)
+}
+
+func aggregateDimensions(metadata Metadata) Metadata {
+	return Metadata{
+		User: metadata.User, Database: metadata.Database, ApplicationName: metadata.ApplicationName,
+		ClientAddress: metadata.ClientAddress,
+	}
 }
 
 func (c *Collector) AddDecodeError() {
 	c.mu.Lock()
 	c.decodeErrors++
+	c.mu.Unlock()
+}
+
+func (c *Collector) ObservePacket(captureLength, originalLength int, matched bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.capture.PacketsSeen++
+	if captureLength > 0 {
+		c.capture.BytesCaptured += uint64(captureLength)
+	}
+	if originalLength > captureLength {
+		c.capture.TruncatedPackets++
+	}
+	if matched {
+		c.capture.PacketsMatched++
+	}
+}
+
+func (c *Collector) SetKernelCaptureStatistics(received, dropped, interfaceDropped uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.capture.KernelPacketsReceived = received
+	c.capture.KernelPacketsDropped = dropped
+	c.capture.InterfacePacketsDropped = interfaceDropped
+}
+
+func (c *Collector) AddCaptureStatisticsError() {
+	c.mu.Lock()
+	c.capture.StatisticsErrors++
+	c.mu.Unlock()
+}
+
+func (c *Collector) AddTCPGap(skipped int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.capture.TCPGapEvents++
+	if skipped > 0 {
+		c.capture.TCPBytesSkipped += uint64(skipped)
+	}
+}
+
+func (c *Collector) AddMidstreamConnection() {
+	c.mu.Lock()
+	c.capture.MidstreamConnections++
 	c.mu.Unlock()
 }
 
@@ -235,7 +365,7 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 
 	report := Report{
 		GeneratedAt: time.Now(), EncryptedSessions: c.encryptedSessions,
-		DecodeErrors: c.decodeErrors, DroppedKeys: c.droppedKeys,
+		DecodeErrors: c.decodeErrors, DroppedKeys: c.droppedKeys, Capture: c.capture,
 		Queries: make([]Summary, 0, len(c.queries)),
 	}
 	for _, stats := range c.queries {
@@ -246,24 +376,38 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 		p95 := min(stats.histogram.quantile(.95, stats.count), stats.max)
 		p99 := min(stats.histogram.quantile(.99, stats.count), stats.max)
 		report.Queries = append(report.Queries, Summary{
-			Fingerprint: stats.fingerprint, Example: stats.example,
+			Fingerprint: stats.fingerprint, Example: stats.example, Dimensions: stats.dimensions,
 			Count: stats.count, Errors: stats.errors, Incomplete: stats.incomplete,
-			Average: average, Min: stats.min, Max: stats.max,
+			RowsAffected: stats.rowsAffected, CommandTags: cloneCounts(stats.commandTags),
+			SQLStates: cloneCounts(stats.sqlstates), Severities: cloneCounts(stats.severities),
+			TransactionStatuses: cloneCounts(stats.transactionStatuses),
+			IncompleteReasons:   cloneCounts(stats.incompleteReasons),
+			Average:             average, Min: stats.min, Max: stats.max,
 			P95: p95, P99: p99, Total: stats.total,
 		})
 	}
 	sort.Slice(report.Queries, func(i, j int) bool {
 		left, right := report.Queries[i], report.Queries[j]
+		var leftValue, rightValue time.Duration
 		switch sortBy {
 		case "count":
-			return left.Count > right.Count
+			if left.Count != right.Count {
+				return left.Count > right.Count
+			}
 		case "total":
-			return left.Total > right.Total
+			leftValue, rightValue = left.Total, right.Total
 		case "p95":
-			return left.P95 > right.P95
+			leftValue, rightValue = left.P95, right.P95
 		default:
-			return left.Max > right.Max
+			leftValue, rightValue = left.Max, right.Max
 		}
+		if leftValue != rightValue {
+			return leftValue > rightValue
+		}
+		if left.Fingerprint != right.Fingerprint {
+			return left.Fingerprint < right.Fingerprint
+		}
+		return dimensionsKey(left.Dimensions) < dimensionsKey(right.Dimensions)
 	})
 	if topN > 0 && len(report.Queries) > topN {
 		report.Queries = report.Queries[:topN]
@@ -271,16 +415,34 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 	return report
 }
 
+func dimensionsKey(metadata Metadata) string {
+	return strings.Join([]string{metadata.User, metadata.Database, metadata.ApplicationName, metadata.ClientAddress}, "\x00")
+}
+
+func cloneCounts(source map[string]uint64) map[string]uint64 {
+	if len(source) == 0 {
+		return nil
+	}
+	result := make(map[string]uint64, len(source))
+	for key, value := range source {
+		result[key] = value
+	}
+	return result
+}
+
 func WriteTable(w io.Writer, report Report) error {
-	if _, err := fmt.Fprintf(w, "queries=%d encrypted_sessions=%d decode_errors=%d dropped_keys=%d\n",
-		len(report.Queries), report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys); err != nil {
+	if _, err := fmt.Fprintf(w, "queries=%d packets=%d matched=%d kernel_drops=%d interface_drops=%d tcp_gaps=%d truncated=%d encrypted_sessions=%d decode_errors=%d dropped_keys=%d\n",
+		len(report.Queries), report.Capture.PacketsSeen, report.Capture.PacketsMatched,
+		report.Capture.KernelPacketsDropped, report.Capture.InterfacePacketsDropped,
+		report.Capture.TCPGapEvents, report.Capture.TruncatedPackets,
+		report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys); err != nil {
 		return err
 	}
 	if len(report.Queries) == 0 {
 		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "CALLS\tERRORS\tINCOMPLETE\tAVG\tP95\tP99\tMAX\tSQL"); err != nil {
+	if _, err := fmt.Fprintln(tw, "CALLS\tERRORS\tINCOMPLETE\tROWS\tAVG\tP95\tP99\tMAX\tCONTEXT\tSQL"); err != nil {
 		return err
 	}
 	for _, summary := range report.Queries {
@@ -288,10 +450,12 @@ func WriteTable(w io.Writer, report Report) error {
 		if summary.Example != "" {
 			query = strings.ReplaceAll(summary.Example, "\n", " ")
 		}
-		if _, err := fmt.Fprintf(tw, "%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\n",
-			summary.Count, summary.Errors, summary.Incomplete, formatDuration(summary.Average),
+		context := fmt.Sprintf("%s/%s/%s@%s", summary.Dimensions.User, summary.Dimensions.Database,
+			summary.Dimensions.ApplicationName, summary.Dimensions.ClientAddress)
+		if _, err := fmt.Fprintf(tw, "%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			summary.Count, summary.Errors, summary.Incomplete, summary.RowsAffected, formatDuration(summary.Average),
 			formatDuration(summary.P95), formatDuration(summary.P99),
-			formatDuration(summary.Max), query); err != nil {
+			formatDuration(summary.Max), context, query); err != nil {
 			return err
 		}
 	}
@@ -310,26 +474,31 @@ func WritePrometheus(w io.Writer, report Report) error {
 	}
 	for _, summary := range report.Queries {
 		label := prometheusLabel(summary.Fingerprint)
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_calls_total{query=\"%s\"} %d\n", label, summary.Count); err != nil {
+		dimensions := fmt.Sprintf("query=\"%s\",user=\"%s\",database=\"%s\",application=\"%s\",client=\"%s\"",
+			label, prometheusLabel(summary.Dimensions.User), prometheusLabel(summary.Dimensions.Database),
+			prometheusLabel(summary.Dimensions.ApplicationName), prometheusLabel(summary.Dimensions.ClientAddress))
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_calls_total{%s} %d\n", dimensions, summary.Count); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_errors_total{query=\"%s\"} %d\n", label, summary.Errors); err != nil {
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_errors_total{%s} %d\n", dimensions, summary.Errors); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds_total{query=\"%s\"} %.9f\n", label, summary.Total.Seconds()); err != nil {
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds_total{%s} %.9f\n", dimensions, summary.Total.Seconds()); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds{query=\"%s\",quantile=\"0.95\"} %.9f\n", label, summary.P95.Seconds()); err != nil {
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds{%s,quantile=\"0.95\"} %.9f\n", dimensions, summary.P95.Seconds()); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds{query=\"%s\",quantile=\"0.99\"} %.9f\n", label, summary.P99.Seconds()); err != nil {
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds{%s,quantile=\"0.99\"} %.9f\n", dimensions, summary.P99.Seconds()); err != nil {
 			return err
 		}
-		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_max_seconds{query=\"%s\"} %.9f\n", label, summary.Max.Seconds()); err != nil {
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_max_seconds{%s} %.9f\n", dimensions, summary.Max.Seconds()); err != nil {
 			return err
 		}
 	}
-	_, err := fmt.Fprintf(w, "pgsniffer_encrypted_sessions_total %d\npgsniffer_decode_errors_total %d\npgsniffer_overflow_events_total %d\n",
+	_, err := fmt.Fprintf(w, "pgsniffer_capture_packets_total %d\npgsniffer_capture_matched_packets_total %d\npgsniffer_capture_kernel_drops_total %d\npgsniffer_capture_interface_drops_total %d\npgsniffer_tcp_gap_events_total %d\npgsniffer_tcp_skipped_bytes_total %d\npgsniffer_encrypted_sessions_total %d\npgsniffer_decode_errors_total %d\npgsniffer_overflow_events_total %d\n",
+		report.Capture.PacketsSeen, report.Capture.PacketsMatched, report.Capture.KernelPacketsDropped,
+		report.Capture.InterfacePacketsDropped, report.Capture.TCPGapEvents, report.Capture.TCPBytesSkipped,
 		report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys)
 	return err
 }
