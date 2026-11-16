@@ -18,9 +18,11 @@ Prebuilt packages and SHA-256 checksums are available on [GitHub Releases](https
 
 - Linux AMD64
 - Linux ARM64
+- macOS Intel
+- macOS Apple Silicon
 - Windows x64
 
-Linux requires the libpcap runtime library. Windows requires [Npcap](https://npcap.com/).
+Linux packages are self-contained and use the native `AF_PACKET` interface. macOS uses the system-provided libpcap and requires no additional capture library. Windows requires [Npcap](https://npcap.com/) only for live capture and interface listing; offline PCAP/PCAPNG analysis has no Npcap dependency.
 
 ## Quick start
 
@@ -89,11 +91,11 @@ Durations are reported in milliseconds:
 - Execution plans and index/cache hit ratios are not part of the wire protocol. Use `EXPLAIN`, `pg_stat_statements`, or `pg_stat_user_indexes` for those metrics.
 - PgSniffer does not connect to PostgreSQL or execute SQL.
 - Raw SQL and PCAP files may contain sensitive data. Restrict their access and retention.
-- Packet capture normally requires elevated privileges or Linux `CAP_NET_RAW`/`CAP_NET_ADMIN` capabilities.
+- Live packet capture normally requires elevated privileges or Linux `CAP_NET_RAW`/`CAP_NET_ADMIN` capabilities.
 
 ## Build from source
 
-Go 1.26.11+ and libpcap development files are required on Unix-like systems.
+Go 1.26.11+ is required. Linux builds do not require libpcap; macOS uses its system libpcap.
 
 ```bash
 make build

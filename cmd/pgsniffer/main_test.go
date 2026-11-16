@@ -67,8 +67,43 @@ func TestRunCaptureOfflinePCAP(t *testing.T) {
 	}
 }
 
+func TestOpenOfflinePCAPNG(t *testing.T) {
+	pcapPath := filepath.Join(t.TempDir(), "postgres.pcapng")
+	file, err := os.Create(pcapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer, err := pcapgo.NewNgWriter(file, layers.LinkTypeEthernet)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := tcpPacket(t, true, 100, pgMessage('Q', append([]byte("SELECT 1"), 0)))
+	if err := writer.WritePacket(captureInfo(time.Unix(1000, 0), len(packet)-54), packet); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	handle, err := openOfflineCapture(pcapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer handle.Close()
+	data, _, err := handle.ReadPacketData()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) != len(packet) {
+		t.Fatalf("packet length = %d, want %d", len(data), len(packet))
+	}
+}
+
 func TestValidateConfig(t *testing.T) {
-	valid := config{server: "127.0.0.1:5432", topN: 10}
+	valid := config{interfaceName: "lo", server: "127.0.0.1:5432", topN: 10}
 	if err := validateConfig(valid); err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +115,15 @@ func TestValidateConfig(t *testing.T) {
 	invalid.server = ""
 	if err := validateConfig(invalid); err == nil {
 		t.Fatal("expected required server error")
+	}
+	invalid = valid
+	invalid.interfaceName = ""
+	if err := validateConfig(invalid); err == nil {
+		t.Fatal("expected required interface error")
+	}
+	invalid.readPCAP = "traffic.pcap"
+	if err := validateConfig(invalid); err != nil {
+		t.Fatalf("offline capture should not require an interface: %v", err)
 	}
 	if got := serverBPFFilter(mustServerEndpoint(t, "127.0.0.1:55432")); got != "host 127.0.0.1 and tcp port 55432" {
 		t.Fatalf("IPv4 filter = %q", got)

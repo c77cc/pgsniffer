@@ -6,7 +6,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/netip"
@@ -20,7 +19,6 @@ import (
 	"github.com/c77cc/pgsniffer/pgsql"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
 	"github.com/gopacket/gopacket/reassembly"
 )
 
@@ -202,7 +200,7 @@ func runMain() error {
 func parseFlags(args []string) (config, error) {
 	var cfg config
 	flags := flag.NewFlagSet("pgsniffer", flag.ContinueOnError)
-	flags.StringVar(&cfg.interfaceName, "i", "lo0", "network interface to capture")
+	flags.StringVar(&cfg.interfaceName, "i", defaultCaptureInterface(), "network interface to capture")
 	flags.StringVar(&cfg.server, "server", "", "PostgreSQL server endpoint as IP:PORT (required)")
 	flags.IntVar(&cfg.topN, "n", 50, "number of query fingerprints to report (0 means all)")
 	flags.BoolVar(&cfg.verbose, "v", false, "log every completed query")
@@ -225,6 +223,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.topN < 0 {
 		return fmt.Errorf("top N cannot be negative")
+	}
+	if cfg.readPCAP == "" && cfg.interfaceName == "" {
+		return fmt.Errorf("-i is required for live capture on this platform; use -l to list interfaces")
 	}
 	return nil
 }
@@ -259,15 +260,11 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	if err != nil {
 		return err
 	}
-	handle, err := openCapture(cfg)
+	handle, err := openCapture(cfg, server)
 	if err != nil {
 		return err
 	}
 	defer handle.Close()
-	filter := serverBPFFilter(server)
-	if err := handle.SetBPFFilter(filter); err != nil {
-		return fmt.Errorf("set BPF filter %q: %w", filter, err)
-	}
 
 	factory := &pgStreamFactory{
 		serverIP: server.Addr().String(), serverPort: layers.TCPPort(server.Port()), collector: collector,
@@ -313,6 +310,9 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 			if !ok {
 				continue
 			}
+			if !packetMatchesServer(network, tcp, server) {
+				continue
+			}
 			assembler.AssembleWithContext(network.NetworkFlow(), tcp, captureContext{info: metadata.CaptureInfo})
 			packetCount++
 			if packetCount%10000 == 0 {
@@ -322,36 +322,16 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	}
 }
 
-func openCapture(cfg config) (*pcap.Handle, error) {
-	if cfg.readPCAP != "" {
-		handle, err := pcap.OpenOffline(cfg.readPCAP)
-		if err != nil {
-			return nil, fmt.Errorf("open PCAP file %q: %w", cfg.readPCAP, err)
-		}
-		return handle, nil
+func packetMatchesServer(network gopacket.NetworkLayer, tcp *layers.TCP, server netip.AddrPort) bool {
+	flow := network.NetworkFlow()
+	source, sourceErr := netip.ParseAddr(flow.Src().String())
+	destination, destinationErr := netip.ParseAddr(flow.Dst().String())
+	if sourceErr != nil || destinationErr != nil {
+		return false
 	}
-	handle, err := pcap.OpenLive(cfg.interfaceName, 65535, true, pcap.BlockForever)
-	if err != nil {
-		return nil, fmt.Errorf("open interface %q: %w", cfg.interfaceName, err)
-	}
-	return handle, nil
-}
-
-func printAllDevices(w io.Writer) error {
-	devices, err := pcap.FindAllDevs()
-	if err != nil {
-		return fmt.Errorf("list interfaces: %w", err)
-	}
-	if len(devices) == 0 {
-		_, err = fmt.Fprintln(w, "No capture interfaces found.")
-		return err
-	}
-	for _, device := range devices {
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%v\n", device.Name, device.Description, device.Addresses); err != nil {
-			return err
-		}
-	}
-	return nil
+	address := server.Addr().Unmap()
+	port := layers.TCPPort(server.Port())
+	return source.Unmap() == address && tcp.SrcPort == port || destination.Unmap() == address && tcp.DstPort == port
 }
 
 func buildVersion() string {

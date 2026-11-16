@@ -24,6 +24,14 @@ jobs:
             runner: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
+          - asset: darwin_amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - asset: darwin_arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
           - asset: windows_amd64
             runner: windows-2025
             goos: windows
@@ -37,16 +45,27 @@ jobs:
           go-version: 1.26.11
           cache: true
 
-      - name: Install libpcap
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
-
       - name: Test
-        if: runner.os == 'Linux'
         run: go test ./...
 
       - name: Build Linux package
         if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          package="pgsniffer_${VERSION}_${{ matrix.asset }}"
+          mkdir -p "dist/${package}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X main.releaseVersion=${VERSION}" \
+            -o "dist/${package}/pgsniffer" ./cmd/pgsniffer
+          "dist/${package}/pgsniffer" --version | grep -F "pgsniffer ${VERSION}"
+          cp README.md README_CN.md LICENSE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          (cd dist && sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256")
+
+      - name: Build macOS package
+        if: runner.os == 'macOS'
         shell: bash
         env:
           VERSION: ${{ github.ref_name }}
@@ -59,7 +78,7 @@ jobs:
           "dist/${package}/pgsniffer" --version | grep -F "pgsniffer ${VERSION}"
           cp README.md README_CN.md LICENSE "dist/${package}/"
           tar -C dist -czf "dist/${package}.tar.gz" "${package}"
-          (cd dist && sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256")
+          (cd dist && shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256")
 
       - name: Build Windows package
         if: runner.os == 'Windows'

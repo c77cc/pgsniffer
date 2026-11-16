@@ -18,9 +18,11 @@ PgSniffer 是一个旁路 PostgreSQL 流量分析工具。它重组 TCP 流、�
 
 - Linux AMD64
 - Linux ARM64
+- macOS Intel
+- macOS Apple Silicon
 - Windows x64
 
-Linux 运行时需要 libpcap；Windows 运行时需要安装 [Npcap](https://npcap.com/)。
+Linux 安装包使用原生 `AF_PACKET`，不依赖外部运行库。macOS 使用系统自带的 libpcap，无需额外安装抓包库。Windows 仅在实时抓包和枚举网卡时需要安装 [Npcap](https://npcap.com/)；离线分析 PCAP/PCAPNG 不依赖 Npcap。
 
 ## 快速使用
 
@@ -89,11 +91,11 @@ sudo ./pgsniffer -i eth0 --server 10.0.0.8:5432 > report.json
 - 执行计划、索引和缓存命中率不在线协议中，需要使用 `EXPLAIN`、`pg_stat_statements` 或 `pg_stat_user_indexes`。
 - PgSniffer 不会主动连接 PostgreSQL，也不会执行 SQL。
 - 原始 SQL 和 PCAP 可能包含敏感数据，应限制访问和保留时间。
-- 抓包通常需要管理员权限，Linux 也可授予 `CAP_NET_RAW`/`CAP_NET_ADMIN` capability。
+- 实时抓包通常需要管理员权限，Linux 也可授予 `CAP_NET_RAW`/`CAP_NET_ADMIN` capability。
 
 ## 从源码构建
 
-类 Unix 系统需要 Go 1.26.11+ 和 libpcap 开发文件。
+需要 Go 1.26.11+。Linux 构建不需要 libpcap；macOS 使用系统提供的 libpcap。
 
 ```bash
 make build
