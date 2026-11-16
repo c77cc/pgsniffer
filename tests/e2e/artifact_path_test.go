@@ -16,8 +16,15 @@ func TestArtifactBase(t *testing.T) {
 		}
 	})
 
-	t.Run("absolute paths remain absolute", func(t *testing.T) {
+	t.Run("rooted paths remain rooted", func(t *testing.T) {
 		configured := filepath.Join(string(filepath.Separator), "tmp", "pgsniffer-e2e")
+		if got := artifactBase(repo, configured); got != configured {
+			t.Fatalf("artifactBase() = %q, want %q", got, configured)
+		}
+	})
+
+	t.Run("absolute paths remain absolute", func(t *testing.T) {
+		configured := filepath.Join(t.TempDir(), "pgsniffer-e2e")
 		if got := artifactBase(repo, configured); got != configured {
 			t.Fatalf("artifactBase() = %q, want %q", got, configured)
 		}
