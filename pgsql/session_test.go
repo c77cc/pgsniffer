@@ -34,9 +34,12 @@ func TestSessionSimpleQuerySplitAndCoalescedResponses(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	firstResponseAt := t0.Add(25 * time.Millisecond)
+	if err := session.Feed(ServerToClient, message('T', nil), firstResponseAt); err != nil {
+		t.Fatal(err)
+	}
 	finishedAt := t0.Add(30 * time.Millisecond)
-	responses := append(message('T', nil), message('C', cstring("SELECT 1"))...)
-	responses = append(responses, message('Z', []byte{'I'})...)
+	responses := append(message('C', cstring("SELECT 1")), message('Z', []byte{'I'})...)
 	if err := session.Feed(ServerToClient, responses, finishedAt); err != nil {
 		t.Fatal(err)
 	}
@@ -48,8 +51,8 @@ func TestSessionSimpleQuerySplitAndCoalescedResponses(t *testing.T) {
 	if event.Query != "SELECT 42" {
 		t.Fatalf("query = %q", event.Query)
 	}
-	if event.Duration != 20*time.Millisecond {
-		t.Fatalf("duration = %s, want 20ms", event.Duration)
+	if event.Duration != 19*time.Millisecond || !event.PhaseObserved || event.FirstResponse != 14*time.Millisecond || event.ResponseTransfer != 5*time.Millisecond {
+		t.Fatalf("timings = duration:%s first:%s transfer:%s observed:%t", event.Duration, event.FirstResponse, event.ResponseTransfer, event.PhaseObserved)
 	}
 	if event.Metadata.User != "alice" || event.Metadata.Database != "app" || event.Metadata.ApplicationName != "psql" {
 		t.Fatalf("metadata = %+v", event.Metadata)
@@ -69,9 +72,16 @@ func TestSessionExtendedQueryMeasuresExecute(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	backend := append(message('1', nil), message('2', nil)...)
-	backend = append(backend, message('C', cstring("SELECT 1"))...)
-	if err := session.Feed(ServerToClient, backend, t0.Add(7*time.Millisecond)); err != nil {
+	if err := session.Feed(ServerToClient, message('1', nil), t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('2', nil), t0.Add(2*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('D', nil), t0.Add(5*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('C', cstring("SELECT 1")), t0.Add(7*time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -83,6 +93,9 @@ func TestSessionExtendedQueryMeasuresExecute(t *testing.T) {
 	}
 	if events[0].Duration != 7*time.Millisecond {
 		t.Fatalf("duration = %s", events[0].Duration)
+	}
+	if !events[0].PhaseObserved || events[0].FirstResponse != 5*time.Millisecond || events[0].ResponseTransfer != 2*time.Millisecond {
+		t.Fatalf("extended timings = %+v", events[0])
 	}
 }
 
@@ -115,6 +128,9 @@ func TestSessionErrorResponse(t *testing.T) {
 	}
 	if events[0].ErrorCode != "42703" || events[0].ErrorInfo != "column does not exist" || events[0].Severity != "ERROR" {
 		t.Fatalf("error event = %+v", events[0])
+	}
+	if !events[0].PhaseObserved || events[0].FirstResponse != time.Millisecond || events[0].ResponseTransfer != time.Millisecond {
+		t.Fatalf("error timings = %+v", events[0])
 	}
 }
 
@@ -206,6 +222,9 @@ func TestSessionMarksTCPGapIncomplete(t *testing.T) {
 	session.Gap(t0.Add(time.Millisecond))
 	if len(events) != 1 || !events[0].Incomplete || events[0].IncompleteReason != "tcp_gap" {
 		t.Fatalf("events = %+v", events)
+	}
+	if events[0].PhaseObserved {
+		t.Fatalf("incomplete query has fabricated phase timings: %+v", events[0])
 	}
 }
 
@@ -365,16 +384,23 @@ func TestSessionDescribeDoesNotStealExecuteCompletion(t *testing.T) {
 	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
 		t.Fatal(err)
 	}
-	backend := append(message('1', nil), message('2', nil)...)
-	backend = append(backend, message('T', nil)...) // Describe response.
-	backend = append(backend, message('T', nil)...) // Execute response.
-	backend = append(backend, message('C', cstring("SELECT 1"))...)
-	backend = append(backend, message('Z', []byte{'I'})...)
-	if err := session.Feed(ServerToClient, backend, t0.Add(5*time.Millisecond)); err != nil {
+	describeResponse := append(message('1', nil), message('2', nil)...)
+	describeResponse = append(describeResponse, message('T', nil)...)
+	if err := session.Feed(ServerToClient, describeResponse, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if err := session.Feed(ServerToClient, message('T', nil), t0.Add(3*time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	completed := append(message('C', cstring("SELECT 1")), message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, completed, t0.Add(5*time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
 	if len(events) != 1 || events[0].Query != "SELECT 1" || events[0].Incomplete || len(events[0].Commands) != 1 {
 		t.Fatalf("events = %+v", events)
+	}
+	if events[0].FirstResponse != 3*time.Millisecond || events[0].ResponseTransfer != 2*time.Millisecond {
+		t.Fatalf("describe response was counted as execute response: %+v", events[0])
 	}
 }
 
@@ -504,6 +530,9 @@ func TestSessionExtendedCopyInAndOutCompleteAtCommandComplete(t *testing.T) {
 			if len(events) != 1 || events[0].Query != test.query || events[0].Incomplete ||
 				len(events[0].Commands) != 1 || events[0].Commands[0].Tag != "COPY" || events[0].Commands[0].RowsAffected != test.rowsAffected {
 				t.Fatalf("events = %+v", events)
+			}
+			if !events[0].PhaseObserved || events[0].FirstResponse != 5*time.Millisecond || events[0].ResponseTransfer != 0 {
+				t.Fatalf("COPY timings = %+v", events[0])
 			}
 		})
 	}

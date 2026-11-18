@@ -57,6 +57,9 @@ type Event struct {
 	StartedAt         time.Time     `json:"started_at"`
 	FinishedAt        time.Time     `json:"finished_at"`
 	Duration          time.Duration `json:"duration"`
+	FirstResponse     time.Duration `json:"first_response"`
+	ResponseTransfer  time.Duration `json:"response_transfer"`
+	PhaseObserved     bool          `json:"phase_observed"`
 	ErrorCode         string        `json:"error_code,omitempty"`
 	ErrorInfo         string        `json:"error,omitempty"`
 	Severity          string        `json:"severity,omitempty"`
@@ -81,6 +84,7 @@ type pendingRequest struct {
 	id                uint64
 	query             string
 	startedAt         time.Time
+	firstResponseAt   time.Time
 	metadata          Metadata
 	simple            bool
 	commands          []Command
@@ -165,6 +169,13 @@ func NewSession(maxFrameSize int, metadata Metadata, emit func(Event)) *Session 
 // Feed adds reassembled stream bytes. A non-nil error means the current half
 // stream was malformed and its buffered bytes were discarded.
 func (s *Session) Feed(direction Direction, data []byte, at time.Time) error {
+	return s.FeedSpan(direction, data, at, at)
+}
+
+// FeedSpan adds reassembled stream bytes with timestamps for their first and
+// last bytes. This lets message timing use completion timestamps when a frame
+// spans multiple captured TCP packets.
+func (s *Session) FeedSpan(direction Direction, data []byte, startedAt, completedAt time.Time) error {
 	if len(data) == 0 {
 		return nil
 	}
@@ -182,12 +193,12 @@ func (s *Session) Feed(direction Direction, data []byte, at time.Time) error {
 	}
 	oldLen := len(buffer.data)
 	if oldLen == 0 {
-		buffer.startedAt = at
+		buffer.startedAt = startedAt
 	}
 	buffer.data = append(buffer.data, data...)
 
 	for len(buffer.data) > 0 {
-		consumed, err := s.consume(direction, buffer.data, buffer.startedAt)
+		consumed, err := s.consume(direction, buffer.data, buffer.startedAt, completedAt)
 		if err != nil {
 			buffer.data = buffer.data[:0]
 			buffer.startedAt = time.Time{}
@@ -208,7 +219,7 @@ func (s *Session) Feed(direction Direction, data []byte, at time.Time) error {
 			return nil
 		}
 		if consumed >= oldLen {
-			buffer.startedAt = at
+			buffer.startedAt = startedAt
 			oldLen = 0
 		} else {
 			oldLen -= consumed
@@ -217,12 +228,12 @@ func (s *Session) Feed(direction Direction, data []byte, at time.Time) error {
 	return nil
 }
 
-func (s *Session) consume(direction Direction, data []byte, at time.Time) (int, error) {
+func (s *Session) consume(direction Direction, data []byte, startedAt, completedAt time.Time) (int, error) {
 	if s.encrypted {
 		return len(data), nil
 	}
 	if direction == ClientToServer && !s.startupDone {
-		return s.consumeStartup(data, at)
+		return s.consumeStartup(data, startedAt, completedAt)
 	}
 	if direction == ServerToClient && s.sslPending {
 		response := data[0]
@@ -232,7 +243,7 @@ func (s *Session) consume(direction Direction, data []byte, at time.Time) (int, 
 		s.sslPending = false
 		if response == 'S' || response == 'G' {
 			s.encrypted = true
-			s.emitEncrypted(at)
+			s.emitEncrypted(completedAt)
 		}
 		return 1, nil
 	}
@@ -254,21 +265,21 @@ func (s *Session) consume(direction Direction, data []byte, at time.Time) (int, 
 
 	payload := data[5:total]
 	if direction == ClientToServer {
-		s.handleFrontend(data[0], payload, at)
+		s.handleFrontend(data[0], payload, completedAt)
 	} else {
-		s.handleBackend(data[0], payload, at)
+		s.handleBackend(data[0], payload, startedAt, completedAt)
 	}
 	return total, nil
 }
 
-func (s *Session) consumeStartup(data []byte, at time.Time) (int, error) {
+func (s *Session) consumeStartup(data []byte, startedAt, completedAt time.Time) (int, error) {
 	// Captures may begin after the connection was established. A plausible
 	// typed frontend message switches directly into regular framing mode.
 	if len(data) >= 5 && isFrontendType(data[0]) {
 		length := int(binary.BigEndian.Uint32(data[1:5]))
 		if length >= 4 && length <= s.maxFrameSize {
 			s.startupDone = true
-			return s.consume(ClientToServer, data, at)
+			return s.consume(ClientToServer, data, startedAt, completedAt)
 		}
 	}
 
@@ -473,7 +484,8 @@ func (s *Session) appendOperation(operation frontendOperation, at time.Time) {
 	s.operations = append(s.operations, operation)
 }
 
-func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
+func (s *Session) handleBackend(typ byte, payload []byte, startedAt, completedAt time.Time) {
+	s.markQueryResponse(typ, startedAt)
 	switch typ {
 	case 'S': // ParameterStatus can change application/session identity.
 		name, rest, ok := readCString(payload)
@@ -495,12 +507,12 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 			s.pending[0].commands = append(s.pending[0].commands, parseCommand(payload))
 		} else if operation, ok := s.consumeOperation(operationExecute); ok {
 			s.addCommand(operation.requestID, parseCommand(payload))
-			s.finishRequest(operation.requestID, at, "", "", "", "")
+			s.finishRequest(operation.requestID, completedAt, "", "", "", "")
 		}
 	case 's': // PortalSuspended completes this Execute, but not the portal.
 		if operation, ok := s.consumeOperation(operationExecute); ok {
 			s.addCommand(operation.requestID, Command{Tag: "PORTAL SUSPENDED"})
-			s.finishRequest(operation.requestID, at, "", "", "", "")
+			s.finishRequest(operation.requestID, completedAt, "", "", "", "")
 		}
 	case 'E':
 		code, message, severity := parseError(payload)
@@ -518,15 +530,16 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 				requestID = s.findExecuteRequest(operation.syncGroup, operation.query)
 			}
 			if requestID != 0 {
-				s.finishRequest(requestID, at, code, message, severity, "")
+				s.markFirstResponse(requestID, startedAt)
+				s.finishRequest(requestID, completedAt, code, message, severity, "")
 			} else if operation.query != "" && (operation.kind == operationParse || operation.kind == operationBind) {
-				s.emitOperationError(operation, at, code, message, severity)
+				s.emitOperationError(operation, startedAt, completedAt, code, message, severity)
 			}
 			break
 		}
 	case 'I': // EmptyQueryResponse
 		if operation, ok := s.consumeOperation(operationExecute); ok {
-			s.finishRequest(operation.requestID, at, "", "", "", "")
+			s.finishRequest(operation.requestID, completedAt, "", "", "", "")
 		}
 	case '1': // ParseComplete
 		s.consumeOperation(operationParse)
@@ -540,14 +553,14 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 		}
 	case 'Z': // ReadyForQuery is the boundary for one Simple Query message.
 		if len(s.pending) > 0 && s.pending[0].simple {
-			s.finishFirst(at, "", "", "", "")
+			s.finishFirst(completedAt, "", "", "", "")
 		}
 		if s.backendSyncGroup < s.frontendSyncGroup {
 			reason := "sync_without_completion"
 			if s.extendedError {
 				reason = "aborted_after_error"
 			}
-			s.finishSyncGroup(s.backendSyncGroup, at, reason)
+			s.finishSyncGroup(s.backendSyncGroup, completedAt, reason)
 			s.dropSyncGroupOperations(s.backendSyncGroup, true)
 			s.extendedError = false
 			s.backendSyncGroup++
@@ -555,6 +568,32 @@ func (s *Session) handleBackend(typ byte, payload []byte, at time.Time) {
 		if len(payload) > 0 {
 			s.transactionStatus = transactionStatusName(payload[0])
 		}
+	}
+}
+
+func (s *Session) markQueryResponse(typ byte, at time.Time) {
+	if !isQueryResponse(typ) {
+		return
+	}
+	if len(s.pending) > 0 && s.pending[0].simple {
+		s.markFirstResponse(s.pending[0].id, at)
+		return
+	}
+	if typ == 'E' || len(s.operations) == 0 {
+		return
+	}
+	operation := s.operations[0]
+	if operation.syncGroup == s.backendSyncGroup && operation.kind == operationExecute {
+		s.markFirstResponse(operation.requestID, at)
+	}
+}
+
+func isQueryResponse(typ byte) bool {
+	switch typ {
+	case 'T', 'D', 'C', 'E', 'I', 'G', 'H', 'W', 'd', 'c', 's', 'n', 'Z':
+		return true
+	default:
+		return false
 	}
 }
 
@@ -583,6 +622,18 @@ func (s *Session) addCommand(requestID uint64, command Command) {
 	for index := range s.pending {
 		if s.pending[index].id == requestID {
 			s.pending[index].commands = append(s.pending[index].commands, command)
+			return
+		}
+	}
+}
+
+func (s *Session) markFirstResponse(requestID uint64, at time.Time) {
+	if requestID == 0 {
+		return
+	}
+	for index := range s.pending {
+		if s.pending[index].id == requestID && s.pending[index].firstResponseAt.IsZero() {
+			s.pending[index].firstResponseAt = at
 			return
 		}
 	}
@@ -659,14 +710,12 @@ func (s *Session) rollbackOperation(operation frontendOperation) {
 	}
 }
 
-func (s *Session) emitOperationError(operation frontendOperation, at time.Time, code, message, severity string) {
-	duration := at.Sub(operation.startedAt)
-	if duration < 0 {
-		duration = 0
-	}
+func (s *Session) emitOperationError(operation frontendOperation, firstResponseAt, finishedAt time.Time, code, message, severity string) {
+	duration, firstResponse, responseTransfer := splitDuration(operation.startedAt, firstResponseAt, finishedAt)
 	s.emit(Event{
-		Query: operation.query, StartedAt: operation.startedAt, FinishedAt: at,
+		Query: operation.query, StartedAt: operation.startedAt, FinishedAt: finishedAt,
 		Duration: duration, ErrorCode: code, ErrorInfo: message, Severity: severity,
+		FirstResponse: firstResponse, ResponseTransfer: responseTransfer, PhaseObserved: true,
 		Metadata: operation.metadata, TransactionStatus: operation.transactionStatus,
 	})
 }
@@ -689,13 +738,32 @@ func (s *Session) finishAt(index int, at time.Time, code, message, severity, inc
 	if duration < 0 {
 		duration = 0
 	}
+	firstResponse, responseTransfer := time.Duration(0), time.Duration(0)
+	phaseObserved := incompleteReason == "" && !pending.firstResponseAt.IsZero()
+	if phaseObserved {
+		duration, firstResponse, responseTransfer = splitDuration(pending.startedAt, pending.firstResponseAt, at)
+	}
 	s.emit(Event{
 		Query: pending.query, StartedAt: pending.startedAt, FinishedAt: at,
 		Duration: duration, ErrorCode: code, ErrorInfo: message,
+		FirstResponse: firstResponse, ResponseTransfer: responseTransfer, PhaseObserved: phaseObserved,
 		Severity: severity, Metadata: pending.metadata, Commands: pending.commands,
 		TransactionStatus: pending.transactionStatus,
 		Incomplete:        incompleteReason != "", IncompleteReason: incompleteReason,
 	})
+}
+
+func splitDuration(startedAt, firstResponseAt, finishedAt time.Time) (time.Duration, time.Duration, time.Duration) {
+	if finishedAt.Before(startedAt) {
+		finishedAt = startedAt
+	}
+	if firstResponseAt.Before(startedAt) {
+		firstResponseAt = startedAt
+	}
+	if firstResponseAt.After(finishedAt) {
+		firstResponseAt = finishedAt
+	}
+	return finishedAt.Sub(startedAt), firstResponseAt.Sub(startedAt), finishedAt.Sub(firstResponseAt)
 }
 
 func (s *Session) finishAll(at time.Time, incompleteReason string) {

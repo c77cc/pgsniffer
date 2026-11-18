@@ -114,6 +114,13 @@ func TestRunCaptureNetworkConditions(t *testing.T) {
 			if report.DecodeErrors != test.wantDecodeErrors {
 				t.Fatalf("decode errors = %d, want %d", report.DecodeErrors, test.wantDecodeErrors)
 			}
+			if test.wantIncomplete {
+				if summary.FirstResponse.Observations != 0 || summary.ResponseTransfer.Observations != 0 {
+					t.Fatalf("incomplete query has phase timings: %+v", summary)
+				}
+			} else if summary.FirstResponse.Observations != 1 || summary.ResponseTransfer.Observations != 1 {
+				t.Fatalf("completed query is missing phase timings: %+v", summary)
+			}
 		})
 	}
 }

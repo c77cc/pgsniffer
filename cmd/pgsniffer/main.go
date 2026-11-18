@@ -134,8 +134,12 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	}
 	data := sg.Fetch(length)
 	info := sg.CaptureInfo(0)
-	if info.Timestamp.After(s.lastSeen) {
-		s.lastSeen = info.Timestamp
+	completedInfo := sg.CaptureInfo(length - 1)
+	if completedInfo.Timestamp.Before(info.Timestamp) {
+		completedInfo = info
+	}
+	if completedInfo.Timestamp.After(s.lastSeen) {
+		s.lastSeen = completedInfo.Timestamp
 	}
 	direction, _, end, skip := sg.Info()
 	if end {
@@ -158,7 +162,7 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	if clientToServer {
 		pgDirection = pgsql.ClientToServer
 	}
-	if err := s.session.Feed(pgDirection, data, info.Timestamp); err != nil {
+	if err := s.session.FeedSpan(pgDirection, data, info.Timestamp, completedInfo.Timestamp); err != nil {
 		s.collector.AddDecodeError()
 		s.session.Abort(info.Timestamp)
 		if s.logQueries {

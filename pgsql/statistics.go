@@ -50,6 +50,38 @@ func (h latencyHistogram) quantile(q float64, count uint64) time.Duration {
 	return 0
 }
 
+type durationStats struct {
+	count     uint64
+	total     time.Duration
+	min       time.Duration
+	max       time.Duration
+	histogram latencyHistogram
+}
+
+func (s *durationStats) add(duration time.Duration) {
+	s.count++
+	s.total += duration
+	if s.count == 1 || duration < s.min {
+		s.min = duration
+	}
+	if duration > s.max {
+		s.max = duration
+	}
+	s.histogram.add(duration)
+}
+
+func (s durationStats) summary() LatencyPhase {
+	if s.count == 0 {
+		return LatencyPhase{}
+	}
+	return LatencyPhase{
+		Observations: s.count, Average: s.total / time.Duration(s.count), Min: s.min,
+		P95: min(s.histogram.quantile(.95, s.count), s.max),
+		P99: min(s.histogram.quantile(.99, s.count), s.max),
+		Max: s.max, Total: s.total,
+	}
+}
+
 type queryStats struct {
 	sql                 string
 	dimensions          Metadata
@@ -57,10 +89,9 @@ type queryStats struct {
 	errors              uint64
 	incomplete          uint64
 	rowsAffected        uint64
-	total               time.Duration
-	min                 time.Duration
-	max                 time.Duration
-	histogram           latencyHistogram
+	latency             durationStats
+	firstResponse       durationStats
+	responseTransfer    durationStats
 	commandTags         map[string]uint64
 	sqlstates           map[string]uint64
 	severities          map[string]uint64
@@ -96,15 +127,40 @@ type Summary struct {
 	P95                 time.Duration
 	P99                 time.Duration
 	Total               time.Duration
+	FirstResponse       LatencyPhase
+	ResponseTransfer    LatencyPhase
+}
+
+// LatencyPhase contains aggregate timings for one phase of a query response.
+type LatencyPhase struct {
+	Observations uint64
+	Average      time.Duration
+	Min          time.Duration
+	P95          time.Duration
+	P99          time.Duration
+	Max          time.Duration
+	Total        time.Duration
 }
 
 type latencyMilliseconds struct {
-	Average float64 `json:"average"`
-	Min     float64 `json:"min"`
-	P95     float64 `json:"p95"`
-	P99     float64 `json:"p99"`
-	Max     float64 `json:"max"`
-	Total   float64 `json:"total"`
+	Average          float64                  `json:"average"`
+	Min              float64                  `json:"min"`
+	P95              float64                  `json:"p95"`
+	P99              float64                  `json:"p99"`
+	Max              float64                  `json:"max"`
+	Total            float64                  `json:"total"`
+	FirstResponse    phaseLatencyMilliseconds `json:"first_response"`
+	ResponseTransfer phaseLatencyMilliseconds `json:"response_transfer"`
+}
+
+type phaseLatencyMilliseconds struct {
+	Observations uint64  `json:"observations"`
+	Average      float64 `json:"average"`
+	Min          float64 `json:"min"`
+	P95          float64 `json:"p95"`
+	P99          float64 `json:"p99"`
+	Max          float64 `json:"max"`
+	Total        float64 `json:"total"`
 }
 
 type summaryJSON struct {
@@ -133,8 +189,19 @@ func (s Summary) MarshalJSON() ([]byte, error) {
 			Average: durationMilliseconds(s.Average), Min: durationMilliseconds(s.Min),
 			P95: durationMilliseconds(s.P95), P99: durationMilliseconds(s.P99),
 			Max: durationMilliseconds(s.Max), Total: durationMilliseconds(s.Total),
+			FirstResponse:    phaseMilliseconds(s.FirstResponse),
+			ResponseTransfer: phaseMilliseconds(s.ResponseTransfer),
 		},
 	})
+}
+
+func phaseMilliseconds(phase LatencyPhase) phaseLatencyMilliseconds {
+	return phaseLatencyMilliseconds{
+		Observations: phase.Observations, Average: durationMilliseconds(phase.Average),
+		Min: durationMilliseconds(phase.Min), P95: durationMilliseconds(phase.P95),
+		P99: durationMilliseconds(phase.P99), Max: durationMilliseconds(phase.Max),
+		Total: durationMilliseconds(phase.Total),
+	}
 }
 
 func (s *Summary) UnmarshalJSON(data []byte) error {
@@ -150,8 +217,19 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 		Average: millisecondsDuration(value.Latency.Average), Min: millisecondsDuration(value.Latency.Min),
 		P95: millisecondsDuration(value.Latency.P95), P99: millisecondsDuration(value.Latency.P99),
 		Max: millisecondsDuration(value.Latency.Max), Total: millisecondsDuration(value.Latency.Total),
+		FirstResponse:    phaseDuration(value.Latency.FirstResponse),
+		ResponseTransfer: phaseDuration(value.Latency.ResponseTransfer),
 	}
 	return nil
+}
+
+func phaseDuration(phase phaseLatencyMilliseconds) LatencyPhase {
+	return LatencyPhase{
+		Observations: phase.Observations, Average: millisecondsDuration(phase.Average),
+		Min: millisecondsDuration(phase.Min), P95: millisecondsDuration(phase.P95),
+		P99: millisecondsDuration(phase.P99), Max: millisecondsDuration(phase.Max),
+		Total: millisecondsDuration(phase.Total),
+	}
 }
 
 func durationMilliseconds(duration time.Duration) float64 {
@@ -267,12 +345,10 @@ func (c *Collector) Add(event Event) {
 	}
 
 	stats.count++
-	stats.total += event.Duration
-	if stats.count == 1 || event.Duration < stats.min {
-		stats.min = event.Duration
-	}
-	if event.Duration > stats.max {
-		stats.max = event.Duration
+	stats.latency.add(event.Duration)
+	if event.PhaseObserved {
+		stats.firstResponse.add(event.FirstResponse)
+		stats.responseTransfer.add(event.ResponseTransfer)
 	}
 	if event.ErrorCode != "" || event.ErrorInfo != "" {
 		stats.errors++
@@ -298,7 +374,6 @@ func (c *Collector) Add(event Event) {
 		}
 		stats.rowsAffected += command.RowsAffected
 	}
-	stats.histogram.add(event.Duration)
 }
 
 func aggregateDimensions(metadata Metadata) Metadata {
@@ -368,20 +443,16 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 		Queries: make([]Summary, 0, len(c.queries)),
 	}
 	for _, stats := range c.queries {
-		average := time.Duration(0)
-		if stats.count > 0 {
-			average = stats.total / time.Duration(stats.count)
-		}
-		p95 := min(stats.histogram.quantile(.95, stats.count), stats.max)
-		p99 := min(stats.histogram.quantile(.99, stats.count), stats.max)
+		latency := stats.latency.summary()
 		summary := Summary{Dimensions: stats.dimensions,
 			Count: stats.count, Errors: stats.errors, Incomplete: stats.incomplete,
 			RowsAffected: stats.rowsAffected, CommandTags: cloneCounts(stats.commandTags),
 			SQLStates: cloneCounts(stats.sqlstates), Severities: cloneCounts(stats.severities),
 			TransactionStatuses: cloneCounts(stats.transactionStatuses),
 			IncompleteReasons:   cloneCounts(stats.incompleteReasons),
-			Average:             average, Min: stats.min, Max: stats.max,
-			P95: p95, P99: p99, Total: stats.total}
+			Average:             latency.Average, Min: latency.Min, Max: latency.Max,
+			P95: latency.P95, P99: latency.P99, Total: latency.Total,
+			FirstResponse: stats.firstResponse.summary(), ResponseTransfer: stats.responseTransfer.summary()}
 		if c.rawSQL {
 			summary.Query = stats.sql
 		} else {

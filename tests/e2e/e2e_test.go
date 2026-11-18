@@ -103,12 +103,24 @@ type summary struct {
 }
 
 type latencyJSON struct {
-	Average float64 `json:"average"`
-	Min     float64 `json:"min"`
-	P95     float64 `json:"p95"`
-	P99     float64 `json:"p99"`
-	Max     float64 `json:"max"`
-	Total   float64 `json:"total"`
+	Average          float64          `json:"average"`
+	Min              float64          `json:"min"`
+	P95              float64          `json:"p95"`
+	P99              float64          `json:"p99"`
+	Max              float64          `json:"max"`
+	Total            float64          `json:"total"`
+	FirstResponse    phaseLatencyJSON `json:"first_response"`
+	ResponseTransfer phaseLatencyJSON `json:"response_transfer"`
+}
+
+type phaseLatencyJSON struct {
+	Observations uint64  `json:"observations"`
+	Average      float64 `json:"average"`
+	Min          float64 `json:"min"`
+	P95          float64 `json:"p95"`
+	P99          float64 `json:"p99"`
+	Max          float64 `json:"max"`
+	Total        float64 `json:"total"`
 }
 
 type capture struct {
@@ -764,6 +776,10 @@ func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct
 		if query.Latency.Min < 0 || query.Latency.Max < query.Latency.Min || query.Latency.Total < query.Latency.Max {
 			t.Errorf("invalid duration aggregate for %q: %+v", query.Fingerprint, query)
 		}
+		expectedObservations := query.Count - query.Incomplete
+		if query.Latency.FirstResponse.Observations != expectedObservations || query.Latency.ResponseTransfer.Observations != expectedObservations {
+			t.Errorf("invalid phase observations for %q: %+v", query.Fingerprint, query.Latency)
+		}
 	}
 }
 
@@ -781,19 +797,35 @@ func (h *harness) assertReportsEqual(t *testing.T, live, offline report) {
 		t.Fatalf("live/offline reports differ\nlive:    %+v\noffline: %+v", live, offline)
 	}
 	for i := range liveTimes {
-		for field := range liveTimes[i] {
-			if delta := absFloat(liveTimes[i][field] - offlineTimes[i][field]); delta > 2 {
+		if liveTimes[i].firstObservations != offlineTimes[i].firstObservations || liveTimes[i].transferObservations != offlineTimes[i].transferObservations {
+			t.Fatalf("live/offline phase observations differ for %q: %+v / %+v", live.Queries[i].Fingerprint, liveTimes[i], offlineTimes[i])
+		}
+		for field := range liveTimes[i].values {
+			if delta := absFloat(liveTimes[i].values[field] - offlineTimes[i].values[field]); delta > 2 {
 				t.Fatalf("live/offline duration differs for %q field %d by %.3fms", live.Queries[i].Fingerprint, field, delta)
 			}
 		}
 	}
 }
 
-func stripReportLatencies(value *report) [][6]float64 {
-	result := make([][6]float64, len(value.Queries))
+type latencySnapshot struct {
+	values                                  [18]float64
+	firstObservations, transferObservations uint64
+}
+
+func stripReportLatencies(value *report) []latencySnapshot {
+	result := make([]latencySnapshot, len(value.Queries))
 	for i := range value.Queries {
 		query := &value.Queries[i]
-		result[i] = [6]float64{query.Latency.Average, query.Latency.Min, query.Latency.Max, query.Latency.P95, query.Latency.P99, query.Latency.Total}
+		first, transfer := query.Latency.FirstResponse, query.Latency.ResponseTransfer
+		result[i] = latencySnapshot{
+			values: [18]float64{
+				query.Latency.Average, query.Latency.Min, query.Latency.Max, query.Latency.P95, query.Latency.P99, query.Latency.Total,
+				first.Average, first.Min, first.Max, first.P95, first.P99, first.Total,
+				transfer.Average, transfer.Min, transfer.Max, transfer.P95, transfer.P99, transfer.Total,
+			},
+			firstObservations: first.Observations, transferObservations: transfer.Observations,
+		}
 		query.Latency = latencyJSON{}
 	}
 	return result

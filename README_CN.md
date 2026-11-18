@@ -136,7 +136,25 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
         "p95": 65.535,
         "p99": 156.734,
         "max": 156.734,
-        "total": 663.65
+        "total": 663.65,
+        "first_response": {
+          "observations": 57,
+          "average": 10.8,
+          "min": 1.2,
+          "p95": 64,
+          "p99": 155,
+          "max": 155,
+          "total": 615.6
+        },
+        "response_transfer": {
+          "observations": 57,
+          "average": 0.843,
+          "min": 0.1,
+          "p95": 1.535,
+          "p99": 1.734,
+          "max": 1.734,
+          "total": 48.05
+        }
       }
     }
   ],
@@ -159,7 +177,68 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 }
 ```
 
-`incomplete` 表示没有获得完整响应的请求数量。`incomplete_reasons` 会区分连接关闭、抓包结束或空闲超时、TCP 缺口、协议错误，以及流水线出错后被跳过的请求。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。`dropped_query_keys` 表示达到有界聚合上限后被合并的新“SQL 与维度”组合数量。
+顶层字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `generated_at` | 生成当前累计报告快照的时间。 |
+| `queries` | 应用分组模式、维度、排序和 `--max-groups` 后的 SQL 分组。 |
+| `capture` | 抓包健康状态和数据完整性计数。 |
+| `encrypted_sessions` | 已识别但无法解码的 TLS/GSS 会话数。 |
+| `decode_errors` | 数据包、TCP 流或 PostgreSQL 协议解码失败次数。 |
+| `dropped_query_keys` | 因有界聚合容量已满、无法接纳新的“SQL 与维度”键而被归入溢出组的查询事件数。 |
+
+每个 `queries` 记录的字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `fingerprint` | 默认模式下作为分组键的归一化 SQL。字面量会被替换，标识符和 `$1` 等占位符会保留。 |
+| `query` | `--group-by raw-sql` 模式下作为分组键的完整原始 SQL，用来替代 `fingerprint`。 |
+| `dimensions.user` | PostgreSQL 启动报文中的用户。 |
+| `dimensions.database` | PostgreSQL 启动报文中的数据库；客户端未指定时默认等于用户。 |
+| `dimensions.application_name` | 客户端提供的 `application_name`。 |
+| `dimensions.client_address` | 从抓取连接中观察到的客户端 IP 地址。 |
+| `calls` | 当前“SQL 与维度”分组中观察到的请求数量。 |
+| `errors` | 观察到 PostgreSQL 错误码或错误消息的请求数量。 |
+| `incomplete` | 未获得完整响应的请求数量，其耗时结束于最后一个可用时间戳。 |
+| `rows_affected` | PostgreSQL `CommandComplete` 标签报告的行数总和，包括查询返回或数据修改的行数。 |
+| `command_tags` | 按 PostgreSQL 命令标签统计的次数，例如 `SELECT`、`INSERT`、`UPDATE`。 |
+| `sqlstates` | 可选，按五位 PostgreSQL SQLSTATE 错误码统计的次数。 |
+| `error_severities` | 可选，按 PostgreSQL 错误级别统计的次数。 |
+| `transaction_status_before` | 按执行前事务状态统计的次数：`idle`、`in_transaction` 或 `failed_transaction`。 |
+| `incomplete_reasons` | 可选，未完整请求的原因计数。 |
+| `latency_ms` | 以毫秒表示的观察耗时聚合。 |
+
+`latency_ms` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `average` | 当前分组全部调用的算术平均耗时。 |
+| `min` / `max` | 观察到的最小和最大耗时。 |
+| `p95` / `p99` | 由有界耗时直方图计算的近似分位数，且不会超过实际观察到的最大值。 |
+| `total` | 当前分组全部调用的观察耗时总和。 |
+| `first_response` | 从完整客户端 Query/Execute 消息到第一个归属于该请求的服务端响应开始之间的耗时，包含服务端等待/执行以及首响应往返抓包点的网络时间。 |
+| `response_transfer` | 从第一个归属响应开始到终止响应完整到达之间的耗时，可能包含服务端后续执行、行序列化和网络传输；对于 COPY 还可能包含 COPY 数据交换。 |
+| `first_response.observations` / `response_transfer.observations` | 成功观察到两个分段边界的调用数。抓包中途开始、丢包或请求中断时可能少于 `calls`。 |
+| 分段中的 `average`、`min`、`p95`、`p99`、`max`、`total` | 与外层同名字段含义一致，但只基于成功获得分段时间的调用。 |
+
+`capture` 字段：
+
+| 字段 | 含义 |
+| --- | --- |
+| `packets_seen` | 抓包来源交给 pgsniffer 的数据包数。 |
+| `packets_matched` | 解码后匹配所配置 PostgreSQL 服务端地址的数据包数。 |
+| `bytes_captured` | 交给 pgsniffer 的抓取字节数。 |
+| `truncated_packets` | 抓取长度小于线上原始长度的数据包数。 |
+| `kernel_packets_received` | 实时抓包后端报告的内核接收包数；离线文件或不支持的后端为零。 |
+| `kernel_packets_dropped` | 实时抓包内核缓冲区丢弃的数据包数。 |
+| `interface_packets_dropped` | 网卡或抓包后端报告的丢包数。 |
+| `tcp_gap_events` | TCP 重组时发现捕获流中缺少字节的次数。 |
+| `tcp_bytes_skipped` | TCP 缺口累计跳过的字节数。 |
+| `midstream_connections` | 在 TCP 握手完成之后才开始观察到的连接数。 |
+| `statistics_errors` | 读取抓包后端统计信息失败的次数。 |
+
+`incomplete_reasons` 可能包含 `connection_closed`、`capture_or_idle_timeout`、`tcp_gap`、`protocol_error`、`client_terminated`、`pending_limit`、`operation_limit`、`sync_without_completion` 和 `aborted_after_error`。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。
 
 启用 `--group-by raw-sql` 后，每条记录按完整原始 SQL 分组，并使用 `query` 字段替代 `fingerprint`：
 
@@ -175,8 +254,9 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 
 ## 耗时语义
 
-- Simple Query：从客户端 `Q` 到服务端 `ReadyForQuery`。
-- Extended Query：从客户端 `Execute` 到服务端 `CommandComplete`、`PortalSuspended` 或 `ErrorResponse`。
+- Simple Query：从完整客户端 `Q` 到完整服务端 `ReadyForQuery`。
+- Extended Query：从完整客户端 `Execute` 到完整服务端 `CommandComplete`、`PortalSuspended` 或 `ErrorResponse`。
+- `first_response` 会忽略 Extended Query 的 `ParseComplete`、`BindComplete` 和 Describe 响应，只从归属于 Execute 的响应开始计算。
 - 请求被中断时使用最后一个已观测数据包的时间戳，并标记为 `incomplete`。
 
 ## SQL 指纹语义

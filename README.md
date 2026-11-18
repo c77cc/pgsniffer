@@ -136,7 +136,25 @@ Durations are reported in milliseconds:
         "p95": 65.535,
         "p99": 156.734,
         "max": 156.734,
-        "total": 663.65
+        "total": 663.65,
+        "first_response": {
+          "observations": 57,
+          "average": 10.8,
+          "min": 1.2,
+          "p95": 64,
+          "p99": 155,
+          "max": 155,
+          "total": 615.6
+        },
+        "response_transfer": {
+          "observations": 57,
+          "average": 0.843,
+          "min": 0.1,
+          "p95": 1.535,
+          "p99": 1.734,
+          "max": 1.734,
+          "total": 48.05
+        }
       }
     }
   ],
@@ -159,7 +177,68 @@ Durations are reported in milliseconds:
 }
 ```
 
-`incomplete` counts requests without a complete response. `incomplete_reasons` distinguishes connection closure, capture/idle timeout, TCP gaps, protocol errors, and pipeline requests skipped after an error. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete. `dropped_query_keys` counts new SQL-and-dimension groups merged after the bounded aggregation limit was reached.
+Top-level fields:
+
+| Field | Meaning |
+| --- | --- |
+| `generated_at` | Time at which this cumulative report snapshot was generated. |
+| `queries` | SQL groups after applying the grouping mode, dimensions, sorting, and `--max-groups`. |
+| `capture` | Capture health and packet completeness counters. |
+| `encrypted_sessions` | TLS/GSS sessions detected but not decoded. |
+| `decode_errors` | Packet, TCP stream, or PostgreSQL protocol decode failures. |
+| `dropped_query_keys` | Query events routed to the bounded overflow group because a new SQL-and-dimensions key could not be admitted. |
+
+Fields in each `queries` entry:
+
+| Field | Meaning |
+| --- | --- |
+| `fingerprint` | Normalized SQL used as the group key in the default mode. Literal values are replaced while identifiers and placeholders such as `$1` are retained. |
+| `query` | Exact original SQL group key in `--group-by raw-sql` mode; replaces `fingerprint`. |
+| `dimensions.user` | PostgreSQL startup user. |
+| `dimensions.database` | PostgreSQL startup database; defaults to the user when the client omits it. |
+| `dimensions.application_name` | Client `application_name`, when available. |
+| `dimensions.client_address` | Client IP address observed in the captured connection. |
+| `calls` | Number of observed requests in this SQL-and-dimensions group. |
+| `errors` | Requests with an observed PostgreSQL error code or error message. |
+| `incomplete` | Requests that did not have a complete response. Their duration ends at the last usable timestamp. |
+| `rows_affected` | Sum of rows reported by PostgreSQL `CommandComplete` tags, including rows selected or modified. |
+| `command_tags` | Counts by PostgreSQL command tag, such as `SELECT`, `INSERT`, or `UPDATE`. |
+| `sqlstates` | Optional counts by five-character PostgreSQL SQLSTATE error code. |
+| `error_severities` | Optional counts by PostgreSQL error severity. |
+| `transaction_status_before` | Counts by transaction state before execution: `idle`, `in_transaction`, or `failed_transaction`. |
+| `incomplete_reasons` | Optional counts explaining incomplete requests. |
+| `latency_ms` | Aggregate observed latency in milliseconds. |
+
+`latency_ms` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `average` | Arithmetic mean over all calls in the group. |
+| `min` / `max` | Smallest and largest observed latency. |
+| `p95` / `p99` | Approximate percentiles from the bounded latency histogram, clamped to the observed maximum. |
+| `total` | Sum of observed latency over all calls. |
+| `first_response` | Time from the complete client Query/Execute message to the beginning of the first attributable server response. It includes server wait/execution and network travel around that first response. |
+| `response_transfer` | Time from the beginning of the first attributable server response until the terminal response is complete. It can include remaining server execution, row serialization, and network transfer; for COPY it can also include COPY data exchange. |
+| `first_response.observations` / `response_transfer.observations` | Calls for which both phase boundaries were observed. This can be lower than `calls` when capture starts late, packets are missing, or requests are interrupted. |
+| Phase `average`, `min`, `p95`, `p99`, `max`, `total` | The same aggregates as the outer latency fields, calculated only over phase observations. |
+
+`capture` fields:
+
+| Field | Meaning |
+| --- | --- |
+| `packets_seen` | Packets delivered by the capture source to pgsniffer. |
+| `packets_matched` | Packets matched to the configured server endpoint after decoding. |
+| `bytes_captured` | Captured bytes delivered to pgsniffer. |
+| `truncated_packets` | Packets whose captured length was smaller than their original wire length. |
+| `kernel_packets_received` | Packets reported as received by the live-capture backend; zero for offline files or unsupported backends. |
+| `kernel_packets_dropped` | Packets dropped by the live-capture kernel buffer. |
+| `interface_packets_dropped` | Packets reported dropped by the network interface or capture backend. |
+| `tcp_gap_events` | TCP reassembly gaps where bytes were missing from the captured stream. |
+| `tcp_bytes_skipped` | Number of bytes skipped across TCP gaps. |
+| `midstream_connections` | Connections first observed after their TCP handshake. |
+| `statistics_errors` | Failures while reading capture-backend statistics. |
+
+`incomplete_reasons` can include `connection_closed`, `capture_or_idle_timeout`, `tcp_gap`, `protocol_error`, `client_terminated`, `pending_limit`, `operation_limit`, `sync_without_completion`, and `aborted_after_error`. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete.
 
 With `--group-by raw-sql`, each entry is grouped by the exact original SQL and uses `query` instead of `fingerprint`:
 
@@ -175,8 +254,9 @@ For Extended Query protocol traffic, PostgreSQL sends SQL text and bind values s
 
 ## Timing semantics
 
-- Simple Query: client `Q` through server `ReadyForQuery`.
-- Extended Query: client `Execute` through `CommandComplete`, `PortalSuspended`, or `ErrorResponse`.
+- Simple Query: complete client `Q` through complete server `ReadyForQuery`.
+- Extended Query: complete client `Execute` through complete `CommandComplete`, `PortalSuspended`, or `ErrorResponse`.
+- `first_response` ignores Extended Query `ParseComplete`, `BindComplete`, and Describe responses; it starts only on a response attributable to Execute.
 - Interrupted requests use the last observed packet timestamp and are marked incomplete.
 
 ## SQL fingerprint semantics

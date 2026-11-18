@@ -89,6 +89,58 @@ func TestJSONDurationUsesReadableMilliseconds(t *testing.T) {
 	}
 }
 
+func TestCollectorAggregatesLatencyPhases(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.Add(Event{
+		Query: "SELECT 1", Duration: 10 * time.Millisecond,
+		FirstResponse: 8 * time.Millisecond, ResponseTransfer: 2 * time.Millisecond, PhaseObserved: true,
+	})
+	collector.Add(Event{
+		Query: "SELECT 1", Duration: 20 * time.Millisecond,
+		FirstResponse: 15 * time.Millisecond, ResponseTransfer: 5 * time.Millisecond, PhaseObserved: true,
+	})
+	collector.Add(Event{Query: "SELECT 1", Duration: 30 * time.Millisecond, Incomplete: true, IncompleteReason: "tcp_gap"})
+
+	summary := collector.Snapshot("max", 0).Queries[0]
+	if summary.Count != 3 || summary.Average != 20*time.Millisecond {
+		t.Fatalf("summary = %+v", summary)
+	}
+	if summary.FirstResponse.Observations != 2 || summary.FirstResponse.Average != 11500*time.Microsecond ||
+		summary.FirstResponse.Max != 15*time.Millisecond || summary.FirstResponse.Total != 23*time.Millisecond {
+		t.Fatalf("first response = %+v", summary.FirstResponse)
+	}
+	if summary.ResponseTransfer.Observations != 2 || summary.ResponseTransfer.Average != 3500*time.Microsecond ||
+		summary.ResponseTransfer.Max != 5*time.Millisecond || summary.ResponseTransfer.Total != 7*time.Millisecond {
+		t.Fatalf("response transfer = %+v", summary.ResponseTransfer)
+	}
+
+	data, err := json.Marshal(summary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"first_response":{"observations":2`) ||
+		!strings.Contains(string(data), `"response_transfer":{"observations":2`) {
+		t.Fatalf("phase JSON = %s", data)
+	}
+	var decoded Summary
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.FirstResponse != summary.FirstResponse || decoded.ResponseTransfer != summary.ResponseTransfer {
+		t.Fatalf("decoded phases = %+v / %+v", decoded.FirstResponse, decoded.ResponseTransfer)
+	}
+}
+
+func TestSummaryUnmarshalAcceptsReportsWithoutLatencyPhases(t *testing.T) {
+	var summary Summary
+	if err := json.Unmarshal([]byte(`{"fingerprint":"select ?","calls":1,"latency_ms":{"average":1,"min":1,"p95":1,"p99":1,"max":1,"total":1}}`), &summary); err != nil {
+		t.Fatal(err)
+	}
+	if summary.Average != time.Millisecond || summary.FirstResponse.Observations != 0 || summary.ResponseTransfer.Observations != 0 {
+		t.Fatalf("summary = %+v", summary)
+	}
+}
+
 func TestCollectorRawSQLUsesExactQueriesAndBoundsLength(t *testing.T) {
 	collector := NewCollector(10, true)
 	collector.Add(Event{Query: "SELECT 1", Duration: time.Millisecond})
