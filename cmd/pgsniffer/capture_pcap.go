@@ -50,8 +50,14 @@ func listCaptureDevices() ([]captureDevice, error) {
 	}
 	devices := make([]captureDevice, 0, len(interfaces))
 	for _, iface := range interfaces {
+		addresses := make([]string, 0, len(iface.Addresses))
+		for _, address := range iface.Addresses {
+			if len(address.IP) > 0 {
+				addresses = append(addresses, address.IP.String())
+			}
+		}
 		devices = append(devices, captureDevice{
-			Name: iface.Name, Description: iface.Description, Addresses: iface.Addresses,
+			Name: iface.Name, Description: iface.Description, Addresses: addresses,
 		})
 	}
 	return devices, nil

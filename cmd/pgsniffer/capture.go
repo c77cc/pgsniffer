@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/netip"
 	"os"
+	"strings"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
@@ -29,7 +30,7 @@ type captureStats struct {
 type captureDevice struct {
 	Name        string
 	Description string
-	Addresses   any
+	Addresses   []string
 }
 
 type offlineCapture struct {
@@ -94,13 +95,48 @@ func printAllDevices(w io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("list interfaces: %w", err)
 	}
+	return printCaptureDevices(w, devices)
+}
+
+func printCaptureDevices(w io.Writer, devices []captureDevice) error {
 	if len(devices) == 0 {
-		_, err = fmt.Fprintln(w, "No capture interfaces found.")
+		_, err := fmt.Fprintln(w, "No capture interfaces found.")
 		return err
 	}
-	for _, device := range devices {
-		if _, err := fmt.Fprintf(w, "%s\t%s\t%v\n", device.Name, device.Description, device.Addresses); err != nil {
+	for index, device := range devices {
+		description := strings.TrimSpace(device.Description)
+		if description == "" {
+			description = device.Name
+		}
+		if _, err := fmt.Fprintf(w, "[%d] %s\n", index+1, description); err != nil {
 			return err
+		}
+		if description != device.Name {
+			if _, err := fmt.Fprintf(w, "    Device:    %s\n", device.Name); err != nil {
+				return err
+			}
+		}
+		if len(device.Addresses) == 0 {
+			if _, err := fmt.Fprintln(w, "    Addresses: not reported"); err != nil {
+				return err
+			}
+		} else {
+			if _, err := fmt.Fprintln(w, "    Addresses:"); err != nil {
+				return err
+			}
+			for _, address := range device.Addresses {
+				if _, err := fmt.Fprintf(w, "      - %s\n", address); err != nil {
+					return err
+				}
+			}
+		}
+		if _, err := fmt.Fprintf(w, "    Usage:     --interface \"%s\"\n", device.Name); err != nil {
+			return err
+		}
+		if index < len(devices)-1 {
+			if _, err := fmt.Fprintln(w); err != nil {
+				return err
+			}
 		}
 	}
 	return nil

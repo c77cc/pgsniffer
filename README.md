@@ -36,6 +36,12 @@ List capture interfaces:
 ./pgsniffer --list-interfaces
 ```
 
+On Windows, copy the listed `Device` value into `--interface`. For local PostgreSQL traffic, use the Npcap loopback device, for example:
+
+```powershell
+.\pgsniffer.exe --interface '\Device\NPF_Loopback' --server 127.0.0.1:5432
+```
+
 Capture a PostgreSQL server until `Ctrl-C`, then print the JSON report:
 
 ```bash

@@ -117,8 +117,16 @@ func listCaptureDevices() ([]captureDevice, error) {
 		if addressErr != nil {
 			return nil, fmt.Errorf("list addresses for %q: %w", iface.Name, addressErr)
 		}
+		formattedAddresses := make([]string, 0, len(addresses))
+		for _, address := range addresses {
+			if ip, _, parseErr := net.ParseCIDR(address.String()); parseErr == nil {
+				formattedAddresses = append(formattedAddresses, ip.String())
+				continue
+			}
+			formattedAddresses = append(formattedAddresses, address.String())
+		}
 		devices = append(devices, captureDevice{
-			Name: iface.Name, Description: iface.Flags.String(), Addresses: addresses,
+			Name: iface.Name, Description: iface.Flags.String(), Addresses: formattedAddresses,
 		})
 	}
 	return devices, nil

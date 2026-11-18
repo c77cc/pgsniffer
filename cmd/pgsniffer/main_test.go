@@ -215,6 +215,50 @@ func TestCustomHelp(t *testing.T) {
 	}
 }
 
+func TestPrintCaptureDevices(t *testing.T) {
+	devices := []captureDevice{
+		{
+			Name:        `\Device\NPF_{12E1F115-0492-452E-9B70-908F209689E1}`,
+			Description: "VMware vmxnet3 virtual network device",
+			Addresses:   []string{"10.95.84.119", "fe80::30bd:df0e:d9bc:4cd6"},
+		},
+		{Name: `\Device\NPF_Loopback`, Description: "Adapter for loopback traffic capture"},
+		{Name: "en0", Addresses: []string{"192.0.2.10"}},
+	}
+	var output bytes.Buffer
+	if err := printCaptureDevices(&output, devices); err != nil {
+		t.Fatal(err)
+	}
+	want := `[1] VMware vmxnet3 virtual network device
+    Device:    \Device\NPF_{12E1F115-0492-452E-9B70-908F209689E1}
+    Addresses:
+      - 10.95.84.119
+      - fe80::30bd:df0e:d9bc:4cd6
+    Usage:     --interface "\Device\NPF_{12E1F115-0492-452E-9B70-908F209689E1}"
+
+[2] Adapter for loopback traffic capture
+    Device:    \Device\NPF_Loopback
+    Addresses: not reported
+    Usage:     --interface "\Device\NPF_Loopback"
+
+[3] en0
+    Addresses:
+      - 192.0.2.10
+    Usage:     --interface "en0"
+`
+	if output.String() != want {
+		t.Fatalf("interface list:\n%s\nwant:\n%s", output.String(), want)
+	}
+
+	output.Reset()
+	if err := printCaptureDevices(&output, nil); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "No capture interfaces found.\n" {
+		t.Fatalf("empty interface list = %q", output.String())
+	}
+}
+
 func TestQueryLogUsesRawSQL(t *testing.T) {
 	var output bytes.Buffer
 	previousOutput := log.Writer()

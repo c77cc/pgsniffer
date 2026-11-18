@@ -36,6 +36,12 @@ Linux 安装包使用 `AF_PACKET`/`TPACKET_V3` 共享内存环形缓冲，不依
 ./pgsniffer --list-interfaces
 ```
 
+Windows 下将列表中的 `Device` 值复制给 `--interface`。抓取本机 PostgreSQL 流量时使用 Npcap 回环设备，例如：
+
+```powershell
+.\pgsniffer.exe --interface '\Device\NPF_Loopback' --server 127.0.0.1:5432
+```
+
 持续抓取 PostgreSQL 服务端流量，按 `Ctrl-C` 后输出 JSON 报告：
 
 ```bash
