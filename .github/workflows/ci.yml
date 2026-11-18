@@ -34,7 +34,7 @@ jobs:
   e2e:
     needs: test
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -45,14 +45,29 @@ jobs:
         with:
           go-version: 1.26.11
           cache: true
+      - uses: actions/setup-java@v5
+        if: matrix.postgres == '16'
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+          cache-dependency-path: tests/e2e/clients/jdbc/pom.xml
+      - uses: actions/setup-dotnet@v5
+        if: matrix.postgres == '16'
+        with:
+          dotnet-version: "10.0.x"
       - name: Install capture dependencies
         run: sudo apt-get update && sudo apt-get install -y libcap2-bin tcpdump
+      - name: Install real client dependencies
+        if: matrix.postgres == '16'
+        run: sudo apt-get install -y maven postgresql-client
       - name: Docker end-to-end tests
         env:
           PGSNIFFER_POSTGRES_IMAGE: postgres:${{ matrix.postgres }}-alpine
           PGSNIFFER_E2E_REQUIRED: "1"
           PGSNIFFER_E2E_SETCAP: "1"
           PGSNIFFER_E2E_ARTIFACTS: .artifacts/e2e/postgres-${{ matrix.postgres }}
+          PGSNIFFER_E2E_REAL_CLIENTS: ${{ matrix.postgres == '16' && '1' || '0' }}
         run: go test -tags=e2e ./tests/e2e -run TestDockerEndToEnd -v -count=1
       - name: Upload failed E2E artifacts
         if: failure()

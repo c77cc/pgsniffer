@@ -1,4 +1,4 @@
-.PHONY: build test check e2e e2e-repeat
+.PHONY: build test check e2e e2e-clients e2e-repeat
 
 build:
 	mkdir -p bin
@@ -14,6 +14,9 @@ check:
 
 e2e:
 	PGSNIFFER_E2E_REQUIRED=1 go test -tags=e2e ./tests/e2e -run TestDockerEndToEnd -v -count=1
+
+e2e-clients:
+	PGSNIFFER_E2E_REQUIRED=1 PGSNIFFER_E2E_REAL_CLIENTS=1 go test -tags=e2e ./tests/e2e -run TestDockerEndToEnd -v -count=1
 
 e2e-repeat:
 	PGSNIFFER_E2E_REQUIRED=1 go test -tags=e2e ./tests/e2e -run TestDockerEndToEnd -v -count=3

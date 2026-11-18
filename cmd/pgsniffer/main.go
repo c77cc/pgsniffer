@@ -19,6 +19,7 @@ import (
 
 	"github.com/c77cc/pgsniffer/pgsql"
 	"github.com/gopacket/gopacket"
+	"github.com/gopacket/gopacket/ip4defrag"
 	"github.com/gopacket/gopacket/layers"
 	"github.com/gopacket/gopacket/reassembly"
 )
@@ -370,6 +371,7 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	assembler := reassembly.NewAssembler(pool)
 	assembler.MaxBufferedPagesPerConnection = 128
 	assembler.MaxBufferedPagesTotal = 4096
+	defragmenter := ip4defrag.NewIPv4Defragmenter()
 
 	source := gopacket.NewPacketSource(handle, handle.LinkType())
 	packets := source.Packets()
@@ -387,6 +389,7 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 		case <-flushTicker.C:
 			if !latestCaptureTime.IsZero() {
 				assembler.FlushCloseOlderThan(latestCaptureTime.Add(-2 * time.Minute))
+				defragmenter.DiscardOlderThan(latestCaptureTime.Add(-2 * time.Minute))
 			}
 		case <-statisticsTicker.C:
 			updateCaptureStatistics(handle, collector)
@@ -404,14 +407,17 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 				collector.AddDecodeError()
 			}
 			latestCaptureTime = metadata.Timestamp
-			network := packet.NetworkLayer()
-			tcpLayer := packet.Layer(layers.LayerTypeTCP)
-			if network == nil || tcpLayer == nil {
+			network, tcp, waitingForFragments, decodeErr := decodeNetworkTCP(packet, defragmenter, metadata.Timestamp)
+			if decodeErr != nil {
+				collector.AddDecodeError()
 				collector.ObservePacket(metadata.CaptureLength, metadata.Length, false)
 				continue
 			}
-			tcp, ok := tcpLayer.(*layers.TCP)
-			if !ok {
+			if waitingForFragments {
+				collector.ObservePacket(metadata.CaptureLength, metadata.Length, fragmentMatchesServer(packet.NetworkLayer(), server))
+				continue
+			}
+			if network == nil || tcp == nil {
 				collector.ObservePacket(metadata.CaptureLength, metadata.Length, false)
 				continue
 			}
@@ -427,6 +433,40 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 			}
 		}
 	}
+}
+
+func decodeNetworkTCP(packet gopacket.Packet, defragmenter *ip4defrag.IPv4Defragmenter, timestamp time.Time) (gopacket.NetworkLayer, *layers.TCP, bool, error) {
+	network := packet.NetworkLayer()
+	if ipv4, ok := network.(*layers.IPv4); ok && (ipv4.Flags&layers.IPv4MoreFragments != 0 || ipv4.FragOffset != 0) {
+		defragmented, err := defragmenter.DefragIPv4WithTimestamp(ipv4, timestamp)
+		if err != nil {
+			return nil, nil, false, fmt.Errorf("defragment IPv4 packet: %w", err)
+		}
+		if defragmented == nil {
+			return nil, nil, true, nil
+		}
+		tcp := &layers.TCP{}
+		if err := tcp.DecodeFromBytes(defragmented.Payload, gopacket.NilDecodeFeedback); err != nil {
+			return nil, nil, false, fmt.Errorf("decode defragmented TCP packet: %w", err)
+		}
+		return defragmented, tcp, false, nil
+	}
+	tcp, _ := packet.Layer(layers.LayerTypeTCP).(*layers.TCP)
+	return network, tcp, false, nil
+}
+
+func fragmentMatchesServer(network gopacket.NetworkLayer, server netip.AddrPort) bool {
+	if network == nil {
+		return false
+	}
+	flow := network.NetworkFlow()
+	source, sourceErr := netip.ParseAddr(flow.Src().String())
+	destination, destinationErr := netip.ParseAddr(flow.Dst().String())
+	if sourceErr != nil || destinationErr != nil {
+		return false
+	}
+	address := server.Addr().Unmap()
+	return source.Unmap() == address || destination.Unmap() == address
 }
 
 func updateCaptureStatistics(handle captureHandle, collector *pgsql.Collector) {

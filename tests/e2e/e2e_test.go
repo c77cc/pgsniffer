@@ -32,21 +32,27 @@ import (
 	"time"
 
 	"github.com/c77cc/pgsniffer/pgsql"
+	"github.com/jackc/pgx/v5"
 )
 
-const commandTimeout = 45 * time.Second
+const (
+	commandTimeout     = 45 * time.Second
+	clientBuildTimeout = 3 * time.Minute
+)
 
 type harness struct {
-	t         *testing.T
-	repo      string
-	artifacts string
-	binary    string
-	tcpdump   string
-	image     string
-	iface     string
-	prefix    string
-	retain    bool
-	resources []dockerResource
+	t             *testing.T
+	repo          string
+	artifacts     string
+	binary        string
+	tcpdump       string
+	image         string
+	iface         string
+	prefix        string
+	retain        bool
+	resources     []dockerResource
+	jdbcClassPath string
+	npgsqlClient  string
 }
 
 type dockerResource struct {
@@ -128,6 +134,7 @@ func TestDockerEndToEnd(t *testing.T) {
 	h.build()
 
 	t.Run("plain_extended_concurrent_and_replay", h.testPlainAndReplay)
+	t.Run("real_client_compatibility", h.testRealClients)
 	t.Run("tls_detection_and_replay", h.testTLS)
 	t.Run("server_interruption", h.testInterruption)
 }
@@ -204,6 +211,108 @@ func (h *harness) build() {
 	if !strings.Contains(list, h.iface) {
 		h.t.Fatalf("capture interface %q not found in:\n%s", h.iface, list)
 	}
+	if os.Getenv("PGSNIFFER_E2E_REAL_CLIENTS") == "1" {
+		h.prepareRealClients()
+	}
+}
+
+func (h *harness) prepareRealClients() {
+	h.t.Helper()
+	for _, command := range []string{"psql", "java", "mvn", "dotnet"} {
+		if _, err := exec.LookPath(command); err != nil {
+			h.t.Fatalf("%s is required when PGSNIFFER_E2E_REAL_CLIENTS=1: %v", command, err)
+		}
+	}
+
+	jdbcProject := filepath.Join(h.repo, "tests", "e2e", "clients", "jdbc")
+	jdbcOutput := filepath.Join(h.artifacts, "jdbc-client")
+	h.runWithTimeout(h.t, clientBuildTimeout, jdbcProject, "mvn", "-q", "-DskipTests", "-Dpgsniffer.build.directory="+jdbcOutput, "package", "dependency:copy-dependencies")
+	separator := string(os.PathListSeparator)
+	h.jdbcClassPath = filepath.Join(jdbcOutput, "classes") + separator + filepath.Join(jdbcOutput, "dependency", "*")
+
+	npgsqlProject := filepath.Join(h.repo, "tests", "e2e", "clients", "npgsql", "PgSnifferE2E.csproj")
+	npgsqlOutput := filepath.Join(h.artifacts, "npgsql-client")
+	h.runWithTimeout(h.t, clientBuildTimeout, h.repo, "dotnet", "build", npgsqlProject, "--configuration", "Release", "--output", npgsqlOutput, "--nologo")
+	h.npgsqlClient = filepath.Join(npgsqlOutput, "PgSnifferE2E.dll")
+}
+
+func (h *harness) testRealClients(t *testing.T) {
+	container, port := h.startPostgres(t, false)
+	cap := h.startCapture(t, "real-clients", port)
+	connectionURL := fmt.Sprintf("postgres://postgres@127.0.0.1:%d/postgres?sslmode=disable", port)
+
+	t.Run("pgx", func(t *testing.T) {
+		config, err := pgx.ParseConfig(connectionURL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		config.RuntimeParams["application_name"] = "pgsniffer-e2e-pgx"
+		ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+		defer cancel()
+		connection, err := pgx.ConnectConfig(ctx, config)
+		if err != nil {
+			t.Fatalf("connect pgx: %v", err)
+		}
+		defer connection.Close(ctx)
+		var value string
+		if err := connection.QueryRow(ctx, "SELECT $1::text AS pgx_value", "pgx-client").Scan(&value); err != nil {
+			t.Fatalf("query with pgx: %v", err)
+		}
+		if value != "pgx-client" {
+			t.Fatalf("pgx value = %q", value)
+		}
+	})
+
+	if os.Getenv("PGSNIFFER_E2E_REAL_CLIENTS") == "1" {
+		t.Run("libpq", func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, "psql", connectionURL, "--no-psqlrc", "--set", "ON_ERROR_STOP=1", "--command", "SELECT 'libpq-client'::text AS libpq_value")
+			cmd.Dir = h.repo
+			cmd.Env = append(os.Environ(), "PGAPPNAME=pgsniffer-e2e-libpq")
+			if output, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("query with libpq/psql: %v\n%s", err, output)
+			}
+		})
+
+		t.Run("jdbc", func(t *testing.T) {
+			jdbcURL := fmt.Sprintf("jdbc:postgresql://127.0.0.1:%d/postgres?sslmode=disable&ApplicationName=pgsniffer-e2e-jdbc", port)
+			h.run(t, h.repo, "java", "-cp", h.jdbcClassPath, "io.github.c77cc.pgsniffer.JdbcClient", jdbcURL)
+		})
+
+		t.Run("npgsql", func(t *testing.T) {
+			connectionString := fmt.Sprintf("Host=127.0.0.1;Port=%d;Database=postgres;Username=postgres;SSL Mode=Disable;Application Name=pgsniffer-e2e-npgsql", port)
+			h.run(t, h.repo, "dotnet", h.npgsqlClient, connectionString)
+		})
+	} else {
+		t.Log("set PGSNIFFER_E2E_REAL_CLIENTS=1 to also run libpq, JDBC, and Npgsql compatibility tests")
+	}
+
+	live := h.stopCapture(t, cap)
+	h.assertHealthy(t, live)
+	type expectedQuery struct {
+		query       string
+		application string
+	}
+	expectedQueries := []expectedQuery{
+		{"SELECT $1::text AS pgx_value", "pgsniffer-e2e-pgx"},
+	}
+	if os.Getenv("PGSNIFFER_E2E_REAL_CLIENTS") == "1" {
+		expectedQueries = append(expectedQueries,
+			expectedQuery{"SELECT 'libpq-client'::text AS libpq_value", "pgsniffer-e2e-libpq"},
+			expectedQuery{"SELECT $1::text AS jdbc_value", "pgsniffer-e2e-jdbc"},
+			expectedQuery{"SELECT $1::text AS npgsql_value", "pgsniffer-e2e-npgsql"},
+		)
+	}
+	for _, expected := range expectedQueries {
+		summary := findSummary(t, live, pgsql.Fingerprint(expected.query))
+		if summary.Count != 1 || summary.Errors != 0 || summary.Incomplete != 0 || summary.Dimensions.ApplicationName != expected.application {
+			t.Errorf("unexpected %s summary: %+v", expected.application, summary)
+		}
+	}
+	offline := h.replay(t, cap.pcapPath, port, "real-clients-replay.json")
+	h.assertReportsEqual(t, live, offline)
+	h.docker(t, "stop", "--time", "2", container)
 }
 
 func (h *harness) testPlainAndReplay(t *testing.T) {
@@ -739,7 +848,12 @@ func (h *harness) dockerOutput(t *testing.T, args ...string) (string, error) {
 
 func (h *harness) run(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), commandTimeout)
+	h.runWithTimeout(t, commandTimeout, dir, name, args...)
+}
+
+func (h *harness) runWithTimeout(t *testing.T, timeout time.Duration, dir, name string, args ...string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir

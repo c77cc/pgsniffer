@@ -1,5 +1,3 @@
-//go:build linux
-
 package main
 
 import (
@@ -31,7 +29,9 @@ func TestServerPortFilter(t *testing.T) {
 	ipv6Request := tcpIPv6Packet(t, true, []byte("request"))
 	ipv6Response := tcpIPv6Packet(t, false, []byte("response"))
 	ipv6ExtensionRequest := addIPv6HopByHopHeader(ipv6Request)
-	vlanRequest := addVLANHeader(request, 42)
+	vlanRequest := addTestVLANHeader(request, uint16(layers.EthernetTypeDot1Q), 42)
+	qinqRequest := addQinQ(request)
+	fragment := ipv4FragmentPacket(t, request, 0, 24, true)
 	for name, packet := range map[string][]byte{
 		"IPv4 destination port": request,
 		"IPv4 source port":      response,
@@ -39,6 +39,8 @@ func TestServerPortFilter(t *testing.T) {
 		"IPv6 source port":      ipv6Response,
 		"IPv6 extension header": ipv6ExtensionRequest,
 		"VLAN":                  vlanRequest,
+		"QinQ":                  qinqRequest,
+		"IPv4 fragment":         fragment,
 	} {
 		t.Run(name, func(t *testing.T) {
 			accepted, runErr := vm.Run(packet)
@@ -105,12 +107,4 @@ func tcpIPv6Packet(t *testing.T, clientToServer bool, payload []byte) []byte {
 		t.Fatal(err)
 	}
 	return buffer.Bytes()
-}
-
-func addVLANHeader(packet []byte, vlanID uint16) []byte {
-	result := make([]byte, 0, len(packet)+4)
-	result = append(result, packet[:12]...)
-	result = binary.BigEndian.AppendUint16(result, 0x8100)
-	result = binary.BigEndian.AppendUint16(result, vlanID&0x0fff)
-	return append(result, packet[12:]...)
 }
