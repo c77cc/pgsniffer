@@ -26,7 +26,7 @@ PgSniffer 是一个旁路 PostgreSQL 流量分析工具。它重组 TCP 流、�
 - macOS Apple Silicon
 - Windows x64
 
-Linux 安装包使用 `AF_PACKET`/`TPACKET_V3` 共享内存环形缓冲，不依赖外部运行库。macOS 使用系统自带的 libpcap，无需额外安装抓包库。Windows 仅在实时抓包和枚举网卡时需要安装 [Npcap](https://npcap.com/)；离线分析 PCAP/PCAPNG 不依赖 Npcap。
+Linux 安装包使用 `AF_PACKET`/`TPACKET_V3` 共享内存环形缓冲，不依赖外部运行库。macOS 使用系统自带的 libpcap，无需额外安装抓包库。Windows 实时抓包和枚举网卡需要安装 [Npcap Installer](https://npcap.com/#download)，无需安装 Npcap SDK；离线分析 PCAP/PCAPNG 不依赖 Npcap。
 
 ## 快速使用
 

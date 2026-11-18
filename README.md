@@ -26,7 +26,7 @@ Prebuilt packages and SHA-256 checksums are available on [GitHub Releases](https
 - macOS Apple Silicon
 - Windows x64
 
-Linux packages are self-contained and use an `AF_PACKET`/`TPACKET_V3` shared-memory ring. macOS uses the system-provided libpcap and requires no additional capture library. Windows requires [Npcap](https://npcap.com/) only for live capture and interface listing; offline PCAP/PCAPNG analysis has no Npcap dependency.
+Linux packages are self-contained and use an `AF_PACKET`/`TPACKET_V3` shared-memory ring. macOS uses the system-provided libpcap and requires no additional capture library. On Windows, live capture and interface listing require the [Npcap Installer](https://npcap.com/#download); the Npcap SDK is not required. Offline PCAP/PCAPNG analysis does not require Npcap.
 
 ## Quick start
 
