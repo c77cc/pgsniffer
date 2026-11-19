@@ -87,7 +87,7 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --group-by raw-sql
 | `--read-pcap FILE` | Analyze a PCAP/PCAPNG file instead of capturing live traffic. |
 | `--group-by MODE` | Group reports by `fingerprint` or `raw-sql` (default: `fingerprint`). Raw SQL may expose sensitive values. |
 | `--log-queries` | Log every completed original SQL query to stderr. This may expose sensitive values. |
-| `--max-groups COUNT` | Maximum number of SQL groups, ordered by maximum latency (default: `50`; `0` reports all groups). |
+| `--max-groups COUNT` | Maximum number of SQL groups, ordered by maximum completed-request latency (default: `50`; `0` reports all groups). |
 | `--listen ADDRESS` | Serve `/healthz`, `/report`, and `/metrics`, for example `127.0.0.1:9108`. |
 | `--report-interval DURATION` | Periodic JSONL report interval, for example `1m`; requires `--report-file`. |
 | `--report-file FILE` | Append periodic JSONL reports to a file; requires `--report-interval`. |
@@ -107,6 +107,8 @@ The endpoints are:
 - `GET /healthz` for liveness checks.
 - `GET /report` for the current cumulative JSON report, limited by `--max-groups`.
 - `GET /metrics` for Prometheus text metrics across all bounded SQL groups.
+
+Prometheus query-duration metrics include completed requests only. `pgsniffer_query_duration_observations_total` reports the number of completed requests contributing to them; `pgsniffer_query_calls_total` continues to include incomplete requests.
 
 Append periodic JSONL snapshots with:
 
@@ -142,6 +144,7 @@ Durations are reported in milliseconds:
       "command_tags": {"SELECT": 57},
       "transaction_status_before": {"idle": 57},
       "latency_ms": {
+        "observations": 57,
         "average": 11.643,
         "min": 1.433,
         "p95": 65.535,
@@ -211,27 +214,31 @@ Fields in each `queries` entry:
 | `dimensions.client_address` | Client IP address observed in the captured connection. |
 | `calls` | Number of observed requests in this SQL-and-dimensions group. |
 | `errors` | Requests with an observed PostgreSQL error code or error message. |
-| `incomplete` | Requests that did not have a complete response. Their duration ends at the last usable timestamp. |
+| `incomplete` | Requests that did not have a complete response. They are excluded from `latency_ms`. |
 | `rows_affected` | Sum of rows reported by PostgreSQL `CommandComplete` tags, including rows selected or modified. |
 | `command_tags` | Counts by PostgreSQL command tag, such as `SELECT`, `INSERT`, or `UPDATE`. |
 | `sqlstates` | Optional counts by five-character PostgreSQL SQLSTATE error code. |
 | `error_severities` | Optional counts by PostgreSQL error severity. |
 | `transaction_status_before` | Counts by transaction state before execution: `idle`, `in_transaction`, or `failed_transaction`. |
 | `incomplete_reasons` | Optional counts explaining incomplete requests. |
-| `latency_ms` | Aggregate observed latency in milliseconds. |
+| `latency_ms` | Completed-request latency in milliseconds. Incomplete requests do not affect these values or latency-based sorting. |
+| `incomplete_observed_duration_ms` | Optional observed-duration aggregate for incomplete requests, ending at the last usable timestamp. It is diagnostic data, not SQL latency. |
 
 `latency_ms` fields:
 
 | Field | Meaning |
 | --- | --- |
-| `average` | Arithmetic mean over all calls in the group. |
-| `min` / `max` | Smallest and largest observed latency. |
+| `observations` | Completed requests included in the latency aggregate. This normally equals `calls - incomplete`. |
+| `average` | Arithmetic mean over completed requests in the group. |
+| `min` / `max` | Smallest and largest completed-request latency. |
 | `p95` / `p99` | Approximate percentiles from the bounded latency histogram, clamped to the observed maximum. |
-| `total` | Sum of observed latency over all calls. |
+| `total` | Sum of completed-request latency. |
 | `first_response` | Time from the complete client Query/Execute message to the beginning of the first attributable server response. It includes server wait/execution and network travel around that first response. |
 | `response_transfer` | Time from the beginning of the first attributable server response until the terminal response is complete. It can include remaining server execution, row serialization, and network transfer; for COPY it can also include COPY data exchange. |
-| `first_response.observations` / `response_transfer.observations` | Calls for which both phase boundaries were observed. This can be lower than `calls` when capture starts late, packets are missing, or requests are interrupted. |
+| `first_response.observations` / `response_transfer.observations` | Completed requests for which both phase boundaries were observed. This can be lower than `latency_ms.observations` when capture starts late or packets are missing. |
 | Phase `average`, `min`, `p95`, `p99`, `max`, `total` | The same aggregates as the outer latency fields, calculated only over phase observations. |
+
+`incomplete_observed_duration_ms` uses the same `observations`, `average`, `min`, `p95`, `p99`, `max`, and `total` fields. Its values measure how long incomplete requests were observable before a connection close, capture end, TCP gap, protocol error, or another incomplete condition. They must not be interpreted as database execution latency.
 
 `capture` fields:
 
@@ -268,7 +275,7 @@ For Extended Query protocol traffic, PostgreSQL sends SQL text and bind values s
 - Simple Query: complete client `Q` through complete server `ReadyForQuery`.
 - Extended Query: complete client `Execute` through complete `CommandComplete`, `PortalSuspended`, or `ErrorResponse`.
 - `first_response` ignores Extended Query `ParseComplete`, `BindComplete`, and Describe responses; it starts only on a response attributable to Execute.
-- Interrupted requests use the last observed packet timestamp and are marked incomplete.
+- Interrupted requests use the last observed packet timestamp, are marked incomplete, and are reported under `incomplete_observed_duration_ms` instead of `latency_ms`.
 
 ## SQL fingerprint semantics
 

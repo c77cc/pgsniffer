@@ -76,7 +76,7 @@ func TestRunCaptureOfflinePCAP(t *testing.T) {
 	if report.Queries[0].Fingerprint != "select ?" || report.Queries[0].Max != 20*time.Millisecond {
 		t.Fatalf("summary = %+v", report.Queries[0])
 	}
-	if report.Queries[0].FirstResponse.Observations != 1 || report.Queries[0].FirstResponse.Max != 20*time.Millisecond ||
+	if report.Queries[0].LatencyObservations != 1 || report.Queries[0].FirstResponse.Observations != 1 || report.Queries[0].FirstResponse.Max != 20*time.Millisecond ||
 		report.Queries[0].ResponseTransfer.Max != 0 {
 		t.Fatalf("latency phases = %+v / %+v", report.Queries[0].FirstResponse, report.Queries[0].ResponseTransfer)
 	}
@@ -376,7 +376,8 @@ func TestReassemblyCompleteUsesConnectionCloseTimestamp(t *testing.T) {
 		t.Fatal("stream should be removable after reassembly completes")
 	}
 	report := collector.Snapshot("max", 0)
-	if len(report.Queries) != 1 || report.Queries[0].Incomplete != 1 || report.Queries[0].Max != 250*time.Millisecond || report.Queries[0].IncompleteReasons["connection_closed"] != 1 {
+	if len(report.Queries) != 1 || report.Queries[0].Incomplete != 1 || report.Queries[0].LatencyObservations != 0 ||
+		report.Queries[0].IncompleteObservedDuration.Max != 250*time.Millisecond || report.Queries[0].IncompleteReasons["connection_closed"] != 1 {
 		t.Fatalf("report = %+v", report)
 	}
 }

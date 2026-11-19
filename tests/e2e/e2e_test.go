@@ -100,9 +100,11 @@ type summary struct {
 	TransactionStatuses map[string]uint64 `json:"transaction_status_before"`
 	IncompleteReasons   map[string]uint64 `json:"incomplete_reasons"`
 	Latency             latencyJSON       `json:"latency_ms"`
+	IncompleteDuration  phaseLatencyJSON  `json:"incomplete_observed_duration_ms"`
 }
 
 type latencyJSON struct {
+	Observations     uint64           `json:"observations"`
 	Average          float64          `json:"average"`
 	Min              float64          `json:"min"`
 	P95              float64          `json:"p95"`
@@ -488,8 +490,8 @@ func (h *harness) testInterruption(t *testing.T) {
 	if live.Queries[0].IncompleteReasons["connection_closed"] != 1 {
 		t.Fatalf("unexpected interruption reason: %+v", live.Queries[0].IncompleteReasons)
 	}
-	if live.Queries[0].Latency.Max < 200 {
-		t.Fatalf("interrupted duration is too short: %.3fms", live.Queries[0].Latency.Max)
+	if live.Queries[0].IncompleteDuration.Max < 200 {
+		t.Fatalf("interrupted observed duration is too short: %.3fms", live.Queries[0].IncompleteDuration.Max)
 	}
 	offline := h.replay(t, cap.pcapPath, port, "interrupted-replay.json")
 	h.assertReportsEqual(t, live, offline)
@@ -795,7 +797,8 @@ func (h *harness) assertQueries(t *testing.T, got report, want map[string]struct
 			t.Errorf("invalid duration aggregate for %q: %+v", query.Fingerprint, query)
 		}
 		expectedObservations := query.Count - query.Incomplete
-		if query.Latency.FirstResponse.Observations != expectedObservations || query.Latency.ResponseTransfer.Observations != expectedObservations {
+		if query.Latency.Observations != expectedObservations || query.Latency.FirstResponse.Observations != expectedObservations ||
+			query.Latency.ResponseTransfer.Observations != expectedObservations || query.IncompleteDuration.Observations != query.Incomplete {
 			t.Errorf("invalid phase observations for %q: %+v", query.Fingerprint, query.Latency)
 		}
 	}
@@ -815,7 +818,10 @@ func (h *harness) assertReportsEqual(t *testing.T, live, offline report) {
 		t.Fatalf("live/offline reports differ\nlive:    %+v\noffline: %+v", live, offline)
 	}
 	for i := range liveTimes {
-		if liveTimes[i].firstObservations != offlineTimes[i].firstObservations || liveTimes[i].transferObservations != offlineTimes[i].transferObservations {
+		if liveTimes[i].latencyObservations != offlineTimes[i].latencyObservations ||
+			liveTimes[i].firstObservations != offlineTimes[i].firstObservations ||
+			liveTimes[i].transferObservations != offlineTimes[i].transferObservations ||
+			liveTimes[i].incompleteObservations != offlineTimes[i].incompleteObservations {
 			t.Fatalf("live/offline phase observations differ for %q: %+v / %+v", live.Queries[i].Fingerprint, liveTimes[i], offlineTimes[i])
 		}
 		for field := range liveTimes[i].values {
@@ -827,24 +833,28 @@ func (h *harness) assertReportsEqual(t *testing.T, live, offline report) {
 }
 
 type latencySnapshot struct {
-	values                                  [18]float64
-	firstObservations, transferObservations uint64
+	values                                                       [24]float64
+	latencyObservations, firstObservations, transferObservations uint64
+	incompleteObservations                                       uint64
 }
 
 func stripReportLatencies(value *report) []latencySnapshot {
 	result := make([]latencySnapshot, len(value.Queries))
 	for i := range value.Queries {
 		query := &value.Queries[i]
-		first, transfer := query.Latency.FirstResponse, query.Latency.ResponseTransfer
+		first, transfer, incomplete := query.Latency.FirstResponse, query.Latency.ResponseTransfer, query.IncompleteDuration
 		result[i] = latencySnapshot{
-			values: [18]float64{
+			values: [24]float64{
 				query.Latency.Average, query.Latency.Min, query.Latency.Max, query.Latency.P95, query.Latency.P99, query.Latency.Total,
 				first.Average, first.Min, first.Max, first.P95, first.P99, first.Total,
 				transfer.Average, transfer.Min, transfer.Max, transfer.P95, transfer.P99, transfer.Total,
+				incomplete.Average, incomplete.Min, incomplete.Max, incomplete.P95, incomplete.P99, incomplete.Total,
 			},
-			firstObservations: first.Observations, transferObservations: transfer.Observations,
+			latencyObservations: query.Latency.Observations, firstObservations: first.Observations,
+			transferObservations: transfer.Observations, incompleteObservations: incomplete.Observations,
 		}
 		query.Latency = latencyJSON{}
+		query.IncompleteDuration = phaseLatencyJSON{}
 	}
 	return result
 }

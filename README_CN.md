@@ -87,7 +87,7 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --group-by raw-sql
 | `--read-pcap FILE` | 分析 PCAP/PCAPNG 文件，不进行实时抓包。 |
 | `--group-by MODE` | 按 `fingerprint` 或 `raw-sql` 聚合报告（默认：`fingerprint`）；原始 SQL 可能暴露敏感值。 |
 | `--log-queries` | 将每条已完成查询的原始 SQL 输出到 stderr，可能暴露敏感值。 |
-| `--max-groups COUNT` | 按最大耗时排序后最多输出的 SQL 分组数（默认：`50`；`0` 表示全部）。 |
+| `--max-groups COUNT` | 按完整请求的最大耗时排序后最多输出的 SQL 分组数（默认：`50`；`0` 表示全部）。 |
 | `--listen ADDRESS` | 提供 `/healthz`、`/report` 和 `/metrics`，例如 `127.0.0.1:9108`。 |
 | `--report-interval DURATION` | 周期性 JSONL 报告的时间间隔，例如 `1m`；必须同时设置 `--report-file`。 |
 | `--report-file FILE` | 追加写入周期性 JSONL 报告；必须同时设置 `--report-interval`。 |
@@ -107,6 +107,8 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
 - `GET /healthz`：存活检查。
 - `GET /report`：当前累计 JSON 报告，遵循 `--max-groups` 限制。
 - `GET /metrics`：Prometheus 文本指标，包含全部有界 SQL 聚合。
+
+Prometheus 查询耗时指标只统计完整请求。`pgsniffer_query_duration_observations_total` 表示参与耗时统计的完整请求数；`pgsniffer_query_calls_total` 仍包含未完成请求。
 
 周期性追加 JSONL 快照：
 
@@ -142,6 +144,7 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
       "command_tags": {"SELECT": 57},
       "transaction_status_before": {"idle": 57},
       "latency_ms": {
+        "observations": 57,
         "average": 11.643,
         "min": 1.433,
         "p95": 65.535,
@@ -211,27 +214,31 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 | `dimensions.client_address` | 从抓取连接中观察到的客户端 IP 地址。 |
 | `calls` | 当前“SQL 与维度”分组中观察到的请求数量。 |
 | `errors` | 观察到 PostgreSQL 错误码或错误消息的请求数量。 |
-| `incomplete` | 未获得完整响应的请求数量，其耗时结束于最后一个可用时间戳。 |
+| `incomplete` | 未获得完整响应的请求数量，不计入 `latency_ms`。 |
 | `rows_affected` | PostgreSQL `CommandComplete` 标签报告的行数总和，包括查询返回或数据修改的行数。 |
 | `command_tags` | 按 PostgreSQL 命令标签统计的次数，例如 `SELECT`、`INSERT`、`UPDATE`。 |
 | `sqlstates` | 可选，按五位 PostgreSQL SQLSTATE 错误码统计的次数。 |
 | `error_severities` | 可选，按 PostgreSQL 错误级别统计的次数。 |
 | `transaction_status_before` | 按执行前事务状态统计的次数：`idle`、`in_transaction` 或 `failed_transaction`。 |
 | `incomplete_reasons` | 可选，未完整请求的原因计数。 |
-| `latency_ms` | 以毫秒表示的观察耗时聚合。 |
+| `latency_ms` | 以毫秒表示的完整请求耗时；未完成请求不会影响这些值和按耗时排序的结果。 |
+| `incomplete_observed_duration_ms` | 可选，未完成请求的观察时长聚合，结束于最后一个可用时间戳；它是诊断数据，不是 SQL 耗时。 |
 
 `latency_ms` 字段：
 
 | 字段 | 含义 |
 | --- | --- |
-| `average` | 当前分组全部调用的算术平均耗时。 |
-| `min` / `max` | 观察到的最小和最大耗时。 |
+| `observations` | 计入耗时聚合的完整请求数，通常等于 `calls - incomplete`。 |
+| `average` | 当前分组完整请求的算术平均耗时。 |
+| `min` / `max` | 完整请求的最小和最大耗时。 |
 | `p95` / `p99` | 由有界耗时直方图计算的近似分位数，且不会超过实际观察到的最大值。 |
-| `total` | 当前分组全部调用的观察耗时总和。 |
+| `total` | 当前分组完整请求的耗时总和。 |
 | `first_response` | 从完整客户端 Query/Execute 消息到第一个归属于该请求的服务端响应开始之间的耗时，包含服务端等待/执行以及首响应往返抓包点的网络时间。 |
 | `response_transfer` | 从第一个归属响应开始到终止响应完整到达之间的耗时，可能包含服务端后续执行、行序列化和网络传输；对于 COPY 还可能包含 COPY 数据交换。 |
-| `first_response.observations` / `response_transfer.observations` | 成功观察到两个分段边界的调用数。抓包中途开始、丢包或请求中断时可能少于 `calls`。 |
+| `first_response.observations` / `response_transfer.observations` | 成功观察到两个分段边界的完整请求数。抓包中途开始或丢包时可能少于 `latency_ms.observations`。 |
 | 分段中的 `average`、`min`、`p95`、`p99`、`max`、`total` | 与外层同名字段含义一致，但只基于成功获得分段时间的调用。 |
+
+`incomplete_observed_duration_ms` 使用相同的 `observations`、`average`、`min`、`p95`、`p99`、`max` 和 `total` 字段。它表示未完成请求从开始到连接关闭、抓包结束、TCP 缺口、协议错误或其他中断条件出现之间的可观察时长，不能解释为数据库执行耗时。
 
 `capture` 字段：
 
@@ -268,7 +275,7 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 - Simple Query：从完整客户端 `Q` 到完整服务端 `ReadyForQuery`。
 - Extended Query：从完整客户端 `Execute` 到完整服务端 `CommandComplete`、`PortalSuspended` 或 `ErrorResponse`。
 - `first_response` 会忽略 Extended Query 的 `ParseComplete`、`BindComplete` 和 Describe 响应，只从归属于 Execute 的响应开始计算。
-- 请求被中断时使用最后一个已观测数据包的时间戳，并标记为 `incomplete`。
+- 请求被中断时使用最后一个已观测数据包的时间戳，标记为 `incomplete`，并将观察时长计入 `incomplete_observed_duration_ms` 而不是 `latency_ms`。
 
 ## SQL 指纹语义
 

@@ -90,6 +90,7 @@ type queryStats struct {
 	incomplete          uint64
 	rowsAffected        uint64
 	latency             durationStats
+	incompleteDuration  durationStats
 	firstResponse       durationStats
 	responseTransfer    durationStats
 	commandTags         map[string]uint64
@@ -109,29 +110,31 @@ type queryKey struct {
 
 // Summary is an immutable statistics snapshot suitable for table or JSON output.
 type Summary struct {
-	Fingerprint         string
-	Query               string
-	Dimensions          Metadata
-	Count               uint64
-	Errors              uint64
-	Incomplete          uint64
-	RowsAffected        uint64
-	CommandTags         map[string]uint64
-	SQLStates           map[string]uint64
-	Severities          map[string]uint64
-	TransactionStatuses map[string]uint64
-	IncompleteReasons   map[string]uint64
-	Average             time.Duration
-	Min                 time.Duration
-	Max                 time.Duration
-	P95                 time.Duration
-	P99                 time.Duration
-	Total               time.Duration
-	FirstResponse       LatencyPhase
-	ResponseTransfer    LatencyPhase
+	Fingerprint                string
+	Query                      string
+	Dimensions                 Metadata
+	Count                      uint64
+	Errors                     uint64
+	Incomplete                 uint64
+	RowsAffected               uint64
+	CommandTags                map[string]uint64
+	SQLStates                  map[string]uint64
+	Severities                 map[string]uint64
+	TransactionStatuses        map[string]uint64
+	IncompleteReasons          map[string]uint64
+	Average                    time.Duration
+	Min                        time.Duration
+	Max                        time.Duration
+	P95                        time.Duration
+	P99                        time.Duration
+	Total                      time.Duration
+	LatencyObservations        uint64
+	FirstResponse              LatencyPhase
+	ResponseTransfer           LatencyPhase
+	IncompleteObservedDuration LatencyPhase
 }
 
-// LatencyPhase contains aggregate timings for one phase of a query response.
+// LatencyPhase contains aggregate timings for a response phase or observed duration.
 type LatencyPhase struct {
 	Observations uint64
 	Average      time.Duration
@@ -143,6 +146,7 @@ type LatencyPhase struct {
 }
 
 type latencyMilliseconds struct {
+	Observations     uint64                   `json:"observations"`
 	Average          float64                  `json:"average"`
 	Min              float64                  `json:"min"`
 	P95              float64                  `json:"p95"`
@@ -164,19 +168,20 @@ type phaseLatencyMilliseconds struct {
 }
 
 type summaryJSON struct {
-	Fingerprint         string              `json:"fingerprint,omitempty"`
-	Query               string              `json:"query,omitempty"`
-	Dimensions          Metadata            `json:"dimensions,omitempty"`
-	Calls               uint64              `json:"calls"`
-	Errors              uint64              `json:"errors"`
-	Incomplete          uint64              `json:"incomplete"`
-	RowsAffected        uint64              `json:"rows_affected"`
-	CommandTags         map[string]uint64   `json:"command_tags,omitempty"`
-	SQLStates           map[string]uint64   `json:"sqlstates,omitempty"`
-	Severities          map[string]uint64   `json:"error_severities,omitempty"`
-	TransactionStatuses map[string]uint64   `json:"transaction_status_before,omitempty"`
-	IncompleteReasons   map[string]uint64   `json:"incomplete_reasons,omitempty"`
-	Latency             latencyMilliseconds `json:"latency_ms"`
+	Fingerprint                string                    `json:"fingerprint,omitempty"`
+	Query                      string                    `json:"query,omitempty"`
+	Dimensions                 Metadata                  `json:"dimensions,omitempty"`
+	Calls                      uint64                    `json:"calls"`
+	Errors                     uint64                    `json:"errors"`
+	Incomplete                 uint64                    `json:"incomplete"`
+	RowsAffected               uint64                    `json:"rows_affected"`
+	CommandTags                map[string]uint64         `json:"command_tags,omitempty"`
+	SQLStates                  map[string]uint64         `json:"sqlstates,omitempty"`
+	Severities                 map[string]uint64         `json:"error_severities,omitempty"`
+	TransactionStatuses        map[string]uint64         `json:"transaction_status_before,omitempty"`
+	IncompleteReasons          map[string]uint64         `json:"incomplete_reasons,omitempty"`
+	Latency                    latencyMilliseconds       `json:"latency_ms"`
+	IncompleteObservedDuration *phaseLatencyMilliseconds `json:"incomplete_observed_duration_ms,omitempty"`
 }
 
 func (s Summary) MarshalJSON() ([]byte, error) {
@@ -186,13 +191,23 @@ func (s Summary) MarshalJSON() ([]byte, error) {
 		CommandTags: s.CommandTags, SQLStates: s.SQLStates, Severities: s.Severities,
 		TransactionStatuses: s.TransactionStatuses, IncompleteReasons: s.IncompleteReasons,
 		Latency: latencyMilliseconds{
-			Average: durationMilliseconds(s.Average), Min: durationMilliseconds(s.Min),
+			Observations: s.LatencyObservations,
+			Average:      durationMilliseconds(s.Average), Min: durationMilliseconds(s.Min),
 			P95: durationMilliseconds(s.P95), P99: durationMilliseconds(s.P99),
 			Max: durationMilliseconds(s.Max), Total: durationMilliseconds(s.Total),
 			FirstResponse:    phaseMilliseconds(s.FirstResponse),
 			ResponseTransfer: phaseMilliseconds(s.ResponseTransfer),
 		},
+		IncompleteObservedDuration: optionalPhaseMilliseconds(s.IncompleteObservedDuration),
 	})
+}
+
+func optionalPhaseMilliseconds(phase LatencyPhase) *phaseLatencyMilliseconds {
+	if phase.Observations == 0 {
+		return nil
+	}
+	value := phaseMilliseconds(phase)
+	return &value
 }
 
 func phaseMilliseconds(phase LatencyPhase) phaseLatencyMilliseconds {
@@ -209,6 +224,13 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
+	observations := value.Latency.Observations
+	if observations == 0 && value.Calls > 0 {
+		// Reports written before observations were added included every call in
+		// latency_ms, including incomplete calls. Preserve that historical sample
+		// count; the completed-only rule applies to newly collected reports.
+		observations = value.Calls
+	}
 	*s = Summary{
 		Fingerprint: value.Fingerprint, Query: value.Query, Dimensions: value.Dimensions, Count: value.Calls,
 		Errors: value.Errors, Incomplete: value.Incomplete, RowsAffected: value.RowsAffected,
@@ -217,8 +239,12 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 		Average: millisecondsDuration(value.Latency.Average), Min: millisecondsDuration(value.Latency.Min),
 		P95: millisecondsDuration(value.Latency.P95), P99: millisecondsDuration(value.Latency.P99),
 		Max: millisecondsDuration(value.Latency.Max), Total: millisecondsDuration(value.Latency.Total),
-		FirstResponse:    phaseDuration(value.Latency.FirstResponse),
-		ResponseTransfer: phaseDuration(value.Latency.ResponseTransfer),
+		LatencyObservations: observations,
+		FirstResponse:       phaseDuration(value.Latency.FirstResponse),
+		ResponseTransfer:    phaseDuration(value.Latency.ResponseTransfer),
+	}
+	if value.IncompleteObservedDuration != nil {
+		s.IncompleteObservedDuration = phaseDuration(*value.IncompleteObservedDuration)
 	}
 	return nil
 }
@@ -345,10 +371,15 @@ func (c *Collector) Add(event Event) {
 	}
 
 	stats.count++
-	stats.latency.add(event.Duration)
-	if event.PhaseObserved {
-		stats.firstResponse.add(event.FirstResponse)
-		stats.responseTransfer.add(event.ResponseTransfer)
+	if event.Incomplete {
+		stats.incomplete++
+		stats.incompleteDuration.add(event.Duration)
+	} else {
+		stats.latency.add(event.Duration)
+		if event.PhaseObserved {
+			stats.firstResponse.add(event.FirstResponse)
+			stats.responseTransfer.add(event.ResponseTransfer)
+		}
 	}
 	if event.ErrorCode != "" || event.ErrorInfo != "" {
 		stats.errors++
@@ -358,9 +389,6 @@ func (c *Collector) Add(event Event) {
 	}
 	if event.Severity != "" {
 		stats.severities[event.Severity]++
-	}
-	if event.Incomplete {
-		stats.incomplete++
 	}
 	if event.IncompleteReason != "" {
 		stats.incompleteReasons[event.IncompleteReason]++
@@ -452,7 +480,9 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 			IncompleteReasons:   cloneCounts(stats.incompleteReasons),
 			Average:             latency.Average, Min: latency.Min, Max: latency.Max,
 			P95: latency.P95, P99: latency.P99, Total: latency.Total,
-			FirstResponse: stats.firstResponse.summary(), ResponseTransfer: stats.responseTransfer.summary()}
+			LatencyObservations: latency.Observations,
+			FirstResponse:       stats.firstResponse.summary(), ResponseTransfer: stats.responseTransfer.summary(),
+			IncompleteObservedDuration: stats.incompleteDuration.summary()}
 		if c.rawSQL {
 			summary.Query = stats.sql
 		} else {
@@ -524,15 +554,15 @@ func WriteTable(w io.Writer, report Report) error {
 		return nil
 	}
 	tw := tabwriter.NewWriter(w, 0, 4, 2, ' ', 0)
-	if _, err := fmt.Fprintln(tw, "CALLS\tERRORS\tINCOMPLETE\tROWS\tAVG\tP95\tP99\tMAX\tCONTEXT\tSQL"); err != nil {
+	if _, err := fmt.Fprintln(tw, "CALLS\tLATENCY_SAMPLES\tERRORS\tINCOMPLETE\tROWS\tAVG\tP95\tP99\tMAX\tCONTEXT\tSQL"); err != nil {
 		return err
 	}
 	for _, summary := range report.Queries {
 		query := strings.ReplaceAll(summary.SQL(), "\n", " ")
 		context := fmt.Sprintf("%s/%s/%s@%s", summary.Dimensions.User, summary.Dimensions.Database,
 			summary.Dimensions.ApplicationName, summary.Dimensions.ClientAddress)
-		if _, err := fmt.Fprintf(tw, "%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
-			summary.Count, summary.Errors, summary.Incomplete, summary.RowsAffected, formatDuration(summary.Average),
+		if _, err := fmt.Fprintf(tw, "%d\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\t%s\t%s\n",
+			summary.Count, summary.LatencyObservations, summary.Errors, summary.Incomplete, summary.RowsAffected, formatDuration(summary.Average),
 			formatDuration(summary.P95), formatDuration(summary.P99),
 			formatDuration(summary.Max), context, query); err != nil {
 			return err
@@ -553,7 +583,7 @@ func WriteJSONLine(w io.Writer, report Report) error {
 }
 
 func WritePrometheus(w io.Writer, report Report) error {
-	if _, err := fmt.Fprintln(w, "# HELP pgsniffer_query_calls_total Observed PostgreSQL query executions.\n# TYPE pgsniffer_query_calls_total counter"); err != nil {
+	if _, err := fmt.Fprintln(w, "# HELP pgsniffer_query_calls_total Observed PostgreSQL query executions.\n# TYPE pgsniffer_query_calls_total counter\n# HELP pgsniffer_query_duration_observations_total Completed query executions included in latency metrics.\n# TYPE pgsniffer_query_duration_observations_total counter"); err != nil {
 		return err
 	}
 	for _, summary := range report.Queries {
@@ -565,6 +595,9 @@ func WritePrometheus(w io.Writer, report Report) error {
 			return err
 		}
 		if _, err := fmt.Fprintf(w, "pgsniffer_query_errors_total{%s} %d\n", dimensions, summary.Errors); err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_observations_total{%s} %d\n", dimensions, summary.LatencyObservations); err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintf(w, "pgsniffer_query_duration_seconds_total{%s} %.9f\n", dimensions, summary.Total.Seconds()); err != nil {

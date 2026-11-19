@@ -300,7 +300,7 @@ SQL output options:
         Log every completed original SQL query to stderr
         Warning: may expose sensitive values
   --max-groups COUNT
-        Maximum number of SQL groups ordered by maximum latency;
+        Maximum number of SQL groups ordered by completed-request maximum latency;
         0 reports all groups (default: 50)
 
 Observability options:

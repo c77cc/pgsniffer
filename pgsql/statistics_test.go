@@ -43,7 +43,7 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if err := WriteTable(&table, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(table.String(), "CALLS") || !strings.Contains(table.String(), "pg_sleep") {
+	if !strings.Contains(table.String(), "LATENCY_SAMPLES") || !strings.Contains(table.String(), "pg_sleep") {
 		t.Fatalf("table = %q", table.String())
 	}
 
@@ -66,7 +66,9 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if err := WritePrometheus(&metrics, report); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(metrics.String(), "pgsniffer_query_calls_total") || !strings.Contains(metrics.String(), "pg_sleep") {
+	if !strings.Contains(metrics.String(), "pgsniffer_query_calls_total") ||
+		!strings.Contains(metrics.String(), "pgsniffer_query_duration_observations_total") ||
+		!strings.Contains(metrics.String(), "pg_sleep") {
 		t.Fatalf("metrics = %q", metrics.String())
 	}
 }
@@ -102,8 +104,13 @@ func TestCollectorAggregatesLatencyPhases(t *testing.T) {
 	collector.Add(Event{Query: "SELECT 1", Duration: 30 * time.Millisecond, Incomplete: true, IncompleteReason: "tcp_gap"})
 
 	summary := collector.Snapshot("max", 0).Queries[0]
-	if summary.Count != 3 || summary.Average != 20*time.Millisecond {
+	if summary.Count != 3 || summary.Incomplete != 1 || summary.LatencyObservations != 2 ||
+		summary.Average != 15*time.Millisecond || summary.Total != 30*time.Millisecond || summary.Max != 20*time.Millisecond {
 		t.Fatalf("summary = %+v", summary)
+	}
+	if summary.IncompleteObservedDuration.Observations != 1 || summary.IncompleteObservedDuration.Average != 30*time.Millisecond ||
+		summary.IncompleteObservedDuration.Max != 30*time.Millisecond || summary.IncompleteObservedDuration.Total != 30*time.Millisecond {
+		t.Fatalf("incomplete duration = %+v", summary.IncompleteObservedDuration)
 	}
 	if summary.FirstResponse.Observations != 2 || summary.FirstResponse.Average != 11500*time.Microsecond ||
 		summary.FirstResponse.Max != 15*time.Millisecond || summary.FirstResponse.Total != 23*time.Millisecond {
@@ -119,25 +126,57 @@ func TestCollectorAggregatesLatencyPhases(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(data), `"first_response":{"observations":2`) ||
-		!strings.Contains(string(data), `"response_transfer":{"observations":2`) {
+		!strings.Contains(string(data), `"response_transfer":{"observations":2`) ||
+		!strings.Contains(string(data), `"latency_ms":{"observations":2`) ||
+		!strings.Contains(string(data), `"incomplete_observed_duration_ms":{"observations":1`) {
 		t.Fatalf("phase JSON = %s", data)
 	}
 	var decoded Summary
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.FirstResponse != summary.FirstResponse || decoded.ResponseTransfer != summary.ResponseTransfer {
-		t.Fatalf("decoded phases = %+v / %+v", decoded.FirstResponse, decoded.ResponseTransfer)
+	if decoded.LatencyObservations != summary.LatencyObservations || decoded.FirstResponse != summary.FirstResponse ||
+		decoded.ResponseTransfer != summary.ResponseTransfer || decoded.IncompleteObservedDuration != summary.IncompleteObservedDuration {
+		t.Fatalf("decoded durations = %+v", decoded)
+	}
+
+	var metrics bytes.Buffer
+	if err := WritePrometheus(&metrics, Report{Queries: []Summary{summary}}); err != nil {
+		t.Fatal(err)
+	}
+	if output := metrics.String(); !strings.Contains(output, "pgsniffer_query_duration_observations_total{query=\"select ?\"") ||
+		!strings.Contains(output, "} 2\n") || !strings.Contains(output, "pgsniffer_query_duration_seconds_total{query=\"select ?\"") ||
+		!strings.Contains(output, "} 0.030000000\n") {
+		t.Fatalf("completed-only latency metrics = %s", output)
 	}
 }
 
 func TestSummaryUnmarshalAcceptsReportsWithoutLatencyPhases(t *testing.T) {
 	var summary Summary
-	if err := json.Unmarshal([]byte(`{"fingerprint":"select ?","calls":1,"latency_ms":{"average":1,"min":1,"p95":1,"p99":1,"max":1,"total":1}}`), &summary); err != nil {
+	if err := json.Unmarshal([]byte(`{"fingerprint":"select ?","calls":2,"incomplete":1,"latency_ms":{"average":1,"min":1,"p95":1,"p99":1,"max":1,"total":2}}`), &summary); err != nil {
 		t.Fatal(err)
 	}
-	if summary.Average != time.Millisecond || summary.FirstResponse.Observations != 0 || summary.ResponseTransfer.Observations != 0 {
+	if summary.Average != time.Millisecond || summary.LatencyObservations != 2 ||
+		summary.FirstResponse.Observations != 0 || summary.ResponseTransfer.Observations != 0 || summary.IncompleteObservedDuration.Observations != 0 {
 		t.Fatalf("summary = %+v", summary)
+	}
+}
+
+func TestIncompleteQueriesDoNotAffectLatencyOrSorting(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.Add(Event{Query: "SELECT fast", Duration: time.Millisecond})
+	collector.Add(Event{Query: "SELECT incomplete", Duration: 10 * time.Second, Incomplete: true, IncompleteReason: "tcp_gap"})
+
+	report := collector.Snapshot("max", 0)
+	if len(report.Queries) != 2 || report.Queries[0].Fingerprint != "select fast" {
+		t.Fatalf("queries sorted by completed latency = %+v", report.Queries)
+	}
+	incomplete := report.Queries[1]
+	if incomplete.LatencyObservations != 0 || incomplete.Average != 0 || incomplete.Max != 0 || incomplete.Total != 0 {
+		t.Fatalf("incomplete query polluted latency = %+v", incomplete)
+	}
+	if incomplete.IncompleteObservedDuration.Observations != 1 || incomplete.IncompleteObservedDuration.Max != 10*time.Second {
+		t.Fatalf("incomplete duration = %+v", incomplete.IncompleteObservedDuration)
 	}
 }
 
