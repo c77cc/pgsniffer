@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -11,6 +12,17 @@ import (
 	"time"
 
 	"github.com/c77cc/pgsniffer/pgsql"
+)
+
+const noTrafficWarningDelay = 10 * time.Second
+
+type captureEventKind uint8
+
+const (
+	captureEventReady captureEventKind = iota
+	captureEventTraffic
+	captureEventSQL
+	captureEventEncrypted
 )
 
 type runtimeServices struct {
@@ -23,6 +35,10 @@ type runtimeServices struct {
 }
 
 func runCaptureWithServices(parent context.Context, cfg config, collector *pgsql.Collector) error {
+	return runCaptureWithStatus(parent, cfg, collector, os.Stderr, noTrafficWarningDelay)
+}
+
+func runCaptureWithStatus(parent context.Context, cfg config, collector *pgsql.Collector, status io.Writer, warningDelay time.Duration) error {
 	ctx, cancel := context.WithCancel(parent)
 	services, err := startRuntimeServices(ctx, cancel, cfg, collector)
 	if err != nil {
@@ -30,33 +46,150 @@ func runCaptureWithServices(parent context.Context, cfg config, collector *pgsql
 		return err
 	}
 
-	captureErrors := make(chan error, 1)
-	go func() { captureErrors <- runCapture(ctx, cfg, collector) }()
-
-	var result error
-	select {
-	case result = <-captureErrors:
+	events := make(chan captureEventKind, 8)
+	notify := func(kind captureEventKind) {
 		select {
-		case serviceErr := <-services.errors:
-			result = serviceErr
+		case events <- kind:
 		default:
 		}
-	case result = <-services.errors:
-		cancel()
-		captureErr := <-captureErrors
-		if result == nil {
-			result = captureErr
+	}
+	captureErrors := make(chan error, 1)
+	go func() { captureErrors <- runCaptureObserved(ctx, cfg, collector, notify) }()
+
+	var result error
+	var warningTimer *time.Timer
+	var warning <-chan time.Time
+	ready, traffic, sql, encrypted := false, false, false, false
+	handleEvent := func(kind captureEventKind) {
+		switch kind {
+		case captureEventReady:
+			if ready {
+				return
+			}
+			ready = true
+			writeCaptureStarted(status, cfg)
+			if cfg.readPCAP == "" && warningDelay > 0 {
+				warningTimer = time.NewTimer(warningDelay)
+				warning = warningTimer.C
+			}
+		case captureEventTraffic:
+			if !traffic {
+				traffic = true
+				_, _ = fmt.Fprintln(status, "pgsniffer: PostgreSQL traffic detected")
+			}
+		case captureEventSQL:
+			if !sql {
+				sql = true
+				_, _ = fmt.Fprintln(status, "pgsniffer: SQL capture is working")
+				stopTimer(warningTimer)
+				warning = nil
+			}
+		case captureEventEncrypted:
+			if !encrypted {
+				encrypted = true
+				_, _ = fmt.Fprintln(status, "pgsniffer: encrypted PostgreSQL session detected; TLS/GSS SQL cannot be decoded")
+				stopTimer(warningTimer)
+				warning = nil
+			}
 		}
-	case <-parent.Done():
-		cancel()
-		result = <-captureErrors
 	}
 
+captureLoop:
+	for {
+		select {
+		case kind := <-events:
+			handleEvent(kind)
+		case <-warning:
+		drainWarningEvents:
+			for {
+				select {
+				case kind := <-events:
+					handleEvent(kind)
+				default:
+					break drainWarningEvents
+				}
+			}
+			if !sql && !encrypted {
+				writeCaptureWarning(status, warningDelay, traffic)
+			}
+			warning = nil
+		case result = <-captureErrors:
+			select {
+			case serviceErr := <-services.errors:
+				result = serviceErr
+			default:
+			}
+			break captureLoop
+		case result = <-services.errors:
+			cancel()
+			captureErr := <-captureErrors
+			if result == nil {
+				result = captureErr
+			}
+			break captureLoop
+		case <-parent.Done():
+			cancel()
+			result = <-captureErrors
+			break captureLoop
+		}
+	}
+	stopTimer(warningTimer)
+	for {
+		select {
+		case kind := <-events:
+			handleEvent(kind)
+		default:
+			goto eventsDrained
+		}
+	}
+
+eventsDrained:
 	cancel()
 	if closeErr := services.close(); result == nil {
 		result = closeErr
 	}
+	if ready {
+		writeCaptureStopped(status, collector)
+	}
 	return result
+}
+
+func stopTimer(timer *time.Timer) {
+	if timer != nil {
+		timer.Stop()
+	}
+}
+
+func writeCaptureStarted(w io.Writer, cfg config) {
+	if cfg.readPCAP != "" {
+		_, _ = fmt.Fprintf(w, "pgsniffer: PCAP analysis started file=%q server=%q\n", cfg.readPCAP, cfg.server)
+		return
+	}
+	server, _ := parseServerEndpoint(cfg.server)
+	_, _ = fmt.Fprintf(w, "pgsniffer: capture started interface=%q server=%q filter=%q\n", cfg.interfaceName, cfg.server, serverBPFFilter(server))
+	_, _ = fmt.Fprintln(w, "pgsniffer: waiting for PostgreSQL traffic; press Ctrl+C to stop and print the report")
+}
+
+func writeCaptureWarning(w io.Writer, delay time.Duration, traffic bool) {
+	if traffic {
+		_, _ = fmt.Fprintf(w, "pgsniffer: PostgreSQL traffic was detected, but no complete SQL was decoded after %s\n", delay)
+		_, _ = fmt.Fprintln(w, "pgsniffer: capture may have started mid-connection; wait for a new query or connection")
+		return
+	}
+	_, _ = fmt.Fprintf(w, "pgsniffer: no matching PostgreSQL traffic detected after %s\n", delay)
+	_, _ = fmt.Fprintln(w, "pgsniffer: check --interface, --server, active connections, and VM/container network routing")
+}
+
+func writeCaptureStopped(w io.Writer, collector *pgsql.Collector) {
+	report := collector.Snapshot("max", 0)
+	var calls, incomplete uint64
+	for _, query := range report.Queries {
+		calls += query.Count
+		incomplete += query.Incomplete
+	}
+	drops := report.Capture.KernelPacketsDropped + report.Capture.InterfacePacketsDropped
+	_, _ = fmt.Fprintf(w, "pgsniffer: capture stopped packets=%d matched=%d queries=%d incomplete=%d encrypted_sessions=%d capture_drops=%d\n",
+		report.Capture.PacketsSeen, report.Capture.PacketsMatched, calls, incomplete, report.EncryptedSessions, drops)
 }
 
 func startRuntimeServices(ctx context.Context, cancel context.CancelFunc, cfg config, collector *pgsql.Collector) (*runtimeServices, error) {

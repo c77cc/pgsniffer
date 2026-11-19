@@ -14,6 +14,7 @@ import (
 	"os/signal"
 	"runtime/debug"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -58,6 +59,9 @@ type pgStreamFactory struct {
 	serverPort layers.TCPPort
 	collector  *pgsql.Collector
 	logQueries bool
+	notify     func(captureEventKind)
+	sqlOnce    sync.Once
+	tlsOnce    sync.Once
 }
 
 type pgStream struct {
@@ -95,12 +99,23 @@ func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reass
 	}
 	stream.session = pgsql.NewSession(pgsql.DefaultMaxFrameSize, metadata, func(event pgsql.Event) {
 		f.collector.Add(event)
+		if event.Encrypted {
+			f.tlsOnce.Do(func() { f.notifyEvent(captureEventEncrypted) })
+		} else if event.Query != "" && !event.Incomplete {
+			f.sqlOnce.Do(func() { f.notifyEvent(captureEventSQL) })
+		}
 		if !f.logQueries {
 			return
 		}
 		logCompletedQuery(event)
 	})
 	return stream
+}
+
+func (f *pgStreamFactory) notifyEvent(kind captureEventKind) {
+	if f.notify != nil {
+		f.notify(kind)
+	}
 }
 
 func logCompletedQuery(event pgsql.Event) {
@@ -356,6 +371,10 @@ func serverBPFFilter(endpoint netip.AddrPort) string {
 }
 
 func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) error {
+	return runCaptureObserved(ctx, cfg, collector, nil)
+}
+
+func runCaptureObserved(ctx context.Context, cfg config, collector *pgsql.Collector, notify func(captureEventKind)) error {
 	server, err := parseServerEndpoint(cfg.server)
 	if err != nil {
 		return err
@@ -366,10 +385,13 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	}
 	defer handle.Close()
 	defer updateCaptureStatistics(handle, collector)
+	if notify != nil {
+		notify(captureEventReady)
+	}
 
 	factory := &pgStreamFactory{
 		serverIP: server.Addr().String(), serverPort: layers.TCPPort(server.Port()), collector: collector,
-		logQueries: cfg.logQueries,
+		logQueries: cfg.logQueries, notify: notify,
 	}
 	pool := reassembly.NewStreamPool(factory)
 	assembler := reassembly.NewAssembler(pool)
@@ -385,6 +407,7 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 	defer statisticsTicker.Stop()
 	latestCaptureTime := time.Time{}
 	packetCount := uint64(0)
+	trafficDetected := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -429,6 +452,12 @@ func runCapture(ctx context.Context, cfg config, collector *pgsql.Collector) err
 			collector.ObservePacket(metadata.CaptureLength, metadata.Length, matched)
 			if !matched {
 				continue
+			}
+			if !trafficDetected {
+				trafficDetected = true
+				if notify != nil {
+					notify(captureEventTraffic)
+				}
 			}
 			assembler.AssembleWithContext(network.NetworkFlow(), tcp, captureContext{info: metadata.CaptureInfo})
 			packetCount++

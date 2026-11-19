@@ -48,6 +48,17 @@ Capture a PostgreSQL server until `Ctrl-C`, then print the JSON report:
 sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 > report.json
 ```
 
+After the interface and capture filter are opened successfully, pgsniffer writes runtime status to stderr:
+
+```text
+pgsniffer: capture started interface="eth0" server="10.0.0.8:5432" filter="host 10.0.0.8 and tcp port 5432"
+pgsniffer: waiting for PostgreSQL traffic; press Ctrl+C to stop and print the report
+pgsniffer: PostgreSQL traffic detected
+pgsniffer: SQL capture is working
+```
+
+If no matching traffic or no complete SQL is seen after 10 seconds, pgsniffer prints a diagnostic hint. TLS/GSS sessions are identified explicitly because their SQL cannot be decoded. On shutdown, a one-line capture summary is written to stderr and the JSON report is written to stdout, so redirecting stdout to `report.json` remains safe.
+
 Analyze an existing PCAP:
 
 ```bash

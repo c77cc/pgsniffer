@@ -48,6 +48,17 @@ Windows 下将列表中的 `Device` 值复制给 `--interface`。抓取本机 Po
 sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 > report.json
 ```
 
+成功打开网卡并安装抓包过滤器后，pgsniffer 会将运行状态输出到 stderr：
+
+```text
+pgsniffer: capture started interface="eth0" server="10.0.0.8:5432" filter="host 10.0.0.8 and tcp port 5432"
+pgsniffer: waiting for PostgreSQL traffic; press Ctrl+C to stop and print the report
+pgsniffer: PostgreSQL traffic detected
+pgsniffer: SQL capture is working
+```
+
+如果 10 秒后仍没有匹配流量或没有解析到完整 SQL，pgsniffer 会输出对应的排查提示。检测到 TLS/GSS 会话时也会明确说明加密 SQL 无法解析。停止抓包时，一行运行摘要会写入 stderr，完整 JSON 报告仍写入 stdout，因此将 stdout 重定向到 `report.json` 不受影响。
+
 分析已有 PCAP：
 
 ```bash

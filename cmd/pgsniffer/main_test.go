@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -59,8 +60,14 @@ func TestRunCaptureOfflinePCAP(t *testing.T) {
 		readPCAP: pcapPath, server: "10.0.0.1:5432", topN: 10,
 	}
 	collector := pgsql.NewCollector(100, false)
-	if err := runCapture(context.Background(), cfg, collector); err != nil {
+	var events []captureEventKind
+	if err := runCaptureObserved(context.Background(), cfg, collector, func(kind captureEventKind) {
+		events = append(events, kind)
+	}); err != nil {
 		t.Fatal(err)
+	}
+	if !slices.Equal(events, []captureEventKind{captureEventReady, captureEventTraffic, captureEventSQL}) {
+		t.Fatalf("capture events = %v", events)
 	}
 	report := collector.Snapshot("max", 10)
 	if len(report.Queries) != 1 {
@@ -78,6 +85,69 @@ func TestRunCaptureOfflinePCAP(t *testing.T) {
 	}
 	if report.Capture.PacketsSeen != 2 || report.Capture.PacketsMatched != 2 || report.Capture.BytesCaptured == 0 || report.Capture.TruncatedPackets != 0 {
 		t.Fatalf("capture statistics = %+v", report.Capture)
+	}
+
+	var status bytes.Buffer
+	if err := runCaptureWithStatus(context.Background(), cfg, pgsql.NewCollector(100, false), &status, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	for _, expected := range []string{"PCAP analysis started", "PostgreSQL traffic detected", "SQL capture is working", "capture stopped"} {
+		if !strings.Contains(status.String(), expected) {
+			t.Errorf("runtime status does not contain %q:\n%s", expected, status.String())
+		}
+	}
+}
+
+func TestRunCaptureDoesNotReportReadyWhenOpenFails(t *testing.T) {
+	collector := pgsql.NewCollector(10, false)
+	var events []captureEventKind
+	err := runCaptureObserved(context.Background(), config{
+		readPCAP: filepath.Join(t.TempDir(), "missing.pcap"), server: "127.0.0.1:5432",
+	}, collector, func(kind captureEventKind) {
+		events = append(events, kind)
+	})
+	if err == nil || len(events) != 0 {
+		t.Fatalf("error = %v, events = %v", err, events)
+	}
+}
+
+func TestRunCaptureReportsEncryptedSession(t *testing.T) {
+	pcapPath := filepath.Join(t.TempDir(), "tls.pcap")
+	file, err := os.Create(pcapPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := pcapgo.NewWriter(file)
+	if err := writer.WriteFileHeader(65535, layers.LinkTypeEthernet); err != nil {
+		t.Fatal(err)
+	}
+	request := make([]byte, 8)
+	binary.BigEndian.PutUint32(request, 8)
+	binary.BigEndian.PutUint32(request[4:], 80877103)
+	t0 := time.Unix(1000, 0)
+	if err := writer.WritePacket(captureInfo(t0, len(request)), tcpPacket(t, true, 100, request)); err != nil {
+		t.Fatal(err)
+	}
+	response := []byte{'S', 0x16, 0x03, 0x03, 0, 10}
+	if err := writer.WritePacket(captureInfo(t0.Add(time.Millisecond), len(response)), tcpPacket(t, false, 500, response)); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	collector := pgsql.NewCollector(10, false)
+	var events []captureEventKind
+	if err := runCaptureObserved(context.Background(), config{readPCAP: pcapPath, server: "10.0.0.1:5432"}, collector, func(kind captureEventKind) {
+		events = append(events, kind)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(events, []captureEventKind{captureEventReady, captureEventTraffic, captureEventEncrypted}) {
+		t.Fatalf("capture events = %v", events)
+	}
+	if got := collector.Snapshot("max", 0).EncryptedSessions; got != 1 {
+		t.Fatalf("encrypted sessions = %d", got)
 	}
 }
 

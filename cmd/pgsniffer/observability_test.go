@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -14,6 +15,42 @@ import (
 
 	"github.com/c77cc/pgsniffer/pgsql"
 )
+
+func TestCaptureStatusMessages(t *testing.T) {
+	var output bytes.Buffer
+	writeCaptureStarted(&output, config{interfaceName: "eth0", server: "10.0.0.8:5432"})
+	writeCaptureWarning(&output, 10*time.Second, false)
+	writeCaptureWarning(&output, 10*time.Second, true)
+
+	collector := pgsql.NewCollector(10, false)
+	collector.ObservePacket(128, 128, true)
+	collector.SetKernelCaptureStatistics(1, 2, 3)
+	collector.Add(pgsql.Event{Query: "SELECT 1", Duration: time.Millisecond})
+	collector.Add(pgsql.Event{Query: "SELECT 2", Duration: time.Millisecond, Incomplete: true, IncompleteReason: "connection_closed"})
+	collector.Add(pgsql.Event{Encrypted: true})
+	writeCaptureStopped(&output, collector)
+
+	text := output.String()
+	for _, expected := range []string{
+		`capture started interface="eth0" server="10.0.0.8:5432" filter="host 10.0.0.8 and tcp port 5432"`,
+		"press Ctrl+C to stop and print the report",
+		"no matching PostgreSQL traffic detected after 10s",
+		"traffic was detected, but no complete SQL was decoded after 10s",
+		"capture stopped packets=1 matched=1 queries=2 incomplete=1 encrypted_sessions=1 capture_drops=5",
+	} {
+		if !strings.Contains(text, expected) {
+			t.Errorf("status output does not contain %q:\n%s", expected, text)
+		}
+	}
+}
+
+func TestCaptureStatusForOfflineAnalysis(t *testing.T) {
+	var output bytes.Buffer
+	writeCaptureStarted(&output, config{readPCAP: "traffic.pcap", server: "10.0.0.8:5432"})
+	if got := output.String(); !strings.Contains(got, `PCAP analysis started file="traffic.pcap" server="10.0.0.8:5432"`) || strings.Contains(got, "Ctrl+C") {
+		t.Fatalf("offline status = %q", got)
+	}
+}
 
 func TestObservabilityHandlers(t *testing.T) {
 	collector := pgsql.NewCollector(10, false)
