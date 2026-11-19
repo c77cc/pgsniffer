@@ -1,0 +1,142 @@
+name: Package
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: Package version; defaults to snapshot-<short-sha>
+        required: false
+        type: string
+        default: ""
+      retention-days:
+        description: Number of days to retain workflow artifacts
+        required: true
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Resolve package version
+        id: version
+        shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          version="${INPUT_VERSION}"
+          if [[ -z "${version}" ]]; then
+            version="snapshot-${GITHUB_SHA::7}"
+          fi
+          echo "value=${version}" >> "${GITHUB_OUTPUT}"
+
+  build:
+    needs: resolve-version
+    name: build (${{ matrix.asset }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: linux_amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - asset: linux_arm64
+            runner: ubuntu-24.04-arm
+            goos: linux
+            goarch: arm64
+          - asset: darwin_amd64
+            runner: macos-15-intel
+            goos: darwin
+            goarch: amd64
+          - asset: darwin_arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+          - asset: windows_amd64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: 1.26.11
+          cache: true
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build Linux package
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          package="pgsniffer_${VERSION}_${{ matrix.asset }}"
+          mkdir -p "dist/${package}"
+          CGO_ENABLED=0 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X main.releaseVersion=${VERSION}" \
+            -o "dist/${package}/pgsniffer" ./cmd/pgsniffer
+          "dist/${package}/pgsniffer" --version | grep -F "pgsniffer ${VERSION}"
+          cp README.md README_CN.md LICENSE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          (cd dist && sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256")
+
+      - name: Build macOS package
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          package="pgsniffer_${VERSION}_${{ matrix.asset }}"
+          mkdir -p "dist/${package}"
+          CGO_ENABLED=1 GOOS=${{ matrix.goos }} GOARCH=${{ matrix.goarch }} \
+            go build -trimpath -ldflags "-s -w -X main.releaseVersion=${VERSION}" \
+            -o "dist/${package}/pgsniffer" ./cmd/pgsniffer
+          "dist/${package}/pgsniffer" --version | grep -F "pgsniffer ${VERSION}"
+          cp README.md README_CN.md LICENSE "dist/${package}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+          (cd dist && shasum -a 256 "${package}.tar.gz" > "${package}.tar.gz.sha256")
+
+      - name: Build Windows package
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: |
+          $package = "pgsniffer_${env:VERSION}_${{ matrix.asset }}"
+          $packageDir = "dist/$package"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          $env:CGO_ENABLED = "0"
+          $env:GOOS = "${{ matrix.goos }}"
+          $env:GOARCH = "${{ matrix.goarch }}"
+          $ldflags = "-s -w -X main.releaseVersion=$env:VERSION"
+          go build -trimpath -ldflags $ldflags -o "$packageDir/pgsniffer.exe" ./cmd/pgsniffer
+          $actual = & "$packageDir/pgsniffer.exe" --version
+          if (-not $actual.StartsWith("pgsniffer $env:VERSION")) {
+            throw "unexpected version: $actual"
+          }
+          Copy-Item README.md, README_CN.md, LICENSE -Destination $packageDir
+          $archive = "dist/$package.zip"
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $archive
+          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          "$hash  $package.zip" | Set-Content -Encoding ascii "$archive.sha256"
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: package-${{ matrix.asset }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}

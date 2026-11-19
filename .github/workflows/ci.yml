@@ -22,14 +22,6 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test -race -coverprofile=coverage.txt ./...
-      - name: Build
-        run: mkdir -p dist && CGO_ENABLED=0 go build -trimpath -o dist/pgsniffer-linux-amd64 ./cmd/pgsniffer
-      - name: Upload Linux binary
-        uses: actions/upload-artifact@v6
-        with:
-          name: pgsniffer-linux-amd64
-          path: dist/pgsniffer-linux-amd64
-          if-no-files-found: error
 
   e2e:
     needs: test
@@ -76,3 +68,10 @@ jobs:
           name: e2e-postgres-${{ matrix.postgres }}
           path: .artifacts/e2e/postgres-${{ matrix.postgres }}
           if-no-files-found: ignore
+
+  package:
+    needs: [test, e2e]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    uses: ./.github/workflows/package.yml
+    with:
+      retention-days: 60
