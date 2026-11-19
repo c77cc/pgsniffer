@@ -110,6 +110,131 @@ The endpoints are:
 
 Prometheus query-duration metrics include completed requests only. `pgsniffer_query_duration_observations_total` reports the number of completed requests contributing to them; `pgsniffer_query_calls_total` continues to include incomplete requests.
 
+### PromQL examples
+
+The examples assume the Prometheus scrape job is named `pgsniffer`. Adjust the label selector to match your configuration.
+
+Top 10 SQL fingerprints by executions per second over the last 5 minutes:
+
+```promql
+topk(
+  10,
+  sum by (query, database) (
+    rate(pgsniffer_query_calls_total{job="pgsniffer"}[5m])
+  )
+)
+```
+
+Top 10 SQL fingerprints by average completed-request latency over the last 5 minutes:
+
+```promql
+topk(
+  10,
+  sum by (query, database) (
+    rate(pgsniffer_query_duration_seconds_total{job="pgsniffer"}[5m])
+  )
+  /
+  clamp_min(
+    sum by (query, database) (
+      rate(pgsniffer_query_duration_observations_total{job="pgsniffer"}[5m])
+    ),
+    1e-9
+  )
+)
+```
+
+Error percentage by database over the last 5 minutes:
+
+```promql
+100 *
+sum by (database) (
+  rate(pgsniffer_query_errors_total{job="pgsniffer"}[5m])
+)
+/
+clamp_min(
+  sum by (database) (
+    rate(pgsniffer_query_calls_total{job="pgsniffer"}[5m])
+  ),
+  1e-9
+)
+```
+
+Global excluded-query percentage over the last 5 minutes:
+
+```promql
+100 *
+sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m]))
+/
+clamp_min(
+  sum(rate(pgsniffer_completed_queries_total{job="pgsniffer"}[5m]))
+  + sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m])),
+  1e-9
+)
+```
+
+SQL groups with the highest cumulative p95 latency since pgsniffer started:
+
+```promql
+topk(
+  10,
+  pgsniffer_query_duration_seconds{
+    job="pgsniffer",
+    quantile="0.95"
+  }
+)
+```
+
+TCP gaps, sequence discontinuities, and protocol-state-loss connections observed during the last 10 minutes:
+
+```promql
+sum(increase(pgsniffer_tcp_gap_events_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+```promql
+sum(increase(pgsniffer_tcp_sequence_discontinuities_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+```promql
+sum(increase(pgsniffer_connections_protocol_state_loss_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+Protocol issues grouped by reason over the last 10 minutes:
+
+```promql
+sum by (issue) (
+  increase(pgsniffer_protocol_issues_total{job="pgsniffer"}[10m])
+)
+```
+
+Percentage of queries missing startup user or database metadata over the last 5 minutes:
+
+```promql
+100 *
+sum(rate(pgsniffer_metadata_missing_queries_total{job="pgsniffer"}[5m]))
+/
+clamp_min(
+  sum(rate(pgsniffer_completed_queries_total{job="pgsniffer"}[5m]))
+  + sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m])),
+  1e-9
+)
+```
+
+Alert when no SQL has been observed for 10 minutes, while pgsniffer is still being scraped:
+
+```promql
+up{job="pgsniffer"} == 1
+and on()
+(
+  sum(rate(pgsniffer_query_calls_total{job="pgsniffer"}[10m]))
+  or vector(0)
+) == 0
+```
+
+`pgsniffer_query_duration_seconds{quantile="0.95"}`, the corresponding `0.99` series, and `pgsniffer_query_duration_max_seconds` are cumulative gauges since process startup, not sliding-window histograms. Use them directly for current rankings; use the duration total divided by observation rates for a windowed average.
+
 Append periodic JSONL snapshots with:
 
 ```bash

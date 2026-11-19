@@ -110,6 +110,131 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 --listen 127.0.0.1:9108
 
 Prometheus 查询耗时指标只统计完整请求。`pgsniffer_query_duration_observations_total` 表示参与耗时统计的完整请求数；`pgsniffer_query_calls_total` 仍包含未完成请求。
 
+### PromQL 示例
+
+以下示例假设 Prometheus 抓取任务名为 `pgsniffer`，请根据实际配置调整标签选择器。
+
+最近 5 分钟每秒执行次数最多的 10 个 SQL 指纹：
+
+```promql
+topk(
+  10,
+  sum by (query, database) (
+    rate(pgsniffer_query_calls_total{job="pgsniffer"}[5m])
+  )
+)
+```
+
+最近 5 分钟完整请求平均耗时最高的 10 个 SQL 指纹：
+
+```promql
+topk(
+  10,
+  sum by (query, database) (
+    rate(pgsniffer_query_duration_seconds_total{job="pgsniffer"}[5m])
+  )
+  /
+  clamp_min(
+    sum by (query, database) (
+      rate(pgsniffer_query_duration_observations_total{job="pgsniffer"}[5m])
+    ),
+    1e-9
+  )
+)
+```
+
+最近 5 分钟各数据库的 SQL 错误率百分比：
+
+```promql
+100 *
+sum by (database) (
+  rate(pgsniffer_query_errors_total{job="pgsniffer"}[5m])
+)
+/
+clamp_min(
+  sum by (database) (
+    rate(pgsniffer_query_calls_total{job="pgsniffer"}[5m])
+  ),
+  1e-9
+)
+```
+
+最近 5 分钟全局被排除查询的百分比：
+
+```promql
+100 *
+sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m]))
+/
+clamp_min(
+  sum(rate(pgsniffer_completed_queries_total{job="pgsniffer"}[5m]))
+  + sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m])),
+  1e-9
+)
+```
+
+pgsniffer 启动以来累计 p95 耗时最高的 SQL 分组：
+
+```promql
+topk(
+  10,
+  pgsniffer_query_duration_seconds{
+    job="pgsniffer",
+    quantile="0.95"
+  }
+)
+```
+
+最近 10 分钟观察到的 TCP 缺口、序列号不连续和协议状态丢失连接：
+
+```promql
+sum(increase(pgsniffer_tcp_gap_events_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+```promql
+sum(increase(pgsniffer_tcp_sequence_discontinuities_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+```promql
+sum(increase(pgsniffer_connections_protocol_state_loss_total{job="pgsniffer"}[10m]))
+or vector(0)
+```
+
+最近 10 分钟按原因统计协议问题：
+
+```promql
+sum by (issue) (
+  increase(pgsniffer_protocol_issues_total{job="pgsniffer"}[10m])
+)
+```
+
+最近 5 分钟缺少启动用户或数据库元数据的查询百分比：
+
+```promql
+100 *
+sum(rate(pgsniffer_metadata_missing_queries_total{job="pgsniffer"}[5m]))
+/
+clamp_min(
+  sum(rate(pgsniffer_completed_queries_total{job="pgsniffer"}[5m]))
+  + sum(rate(pgsniffer_excluded_queries_total{job="pgsniffer"}[5m])),
+  1e-9
+)
+```
+
+pgsniffer 仍可被 Prometheus 抓取，但连续 10 分钟没有观察到 SQL 时告警：
+
+```promql
+up{job="pgsniffer"} == 1
+and on()
+(
+  sum(rate(pgsniffer_query_calls_total{job="pgsniffer"}[10m]))
+  or vector(0)
+) == 0
+```
+
+`pgsniffer_query_duration_seconds{quantile="0.95"}`、对应的 `0.99` 序列以及 `pgsniffer_query_duration_max_seconds` 都是进程启动以来的累计 gauge，并非滑动时间窗口直方图。它们适合直接用于当前排名；窗口平均耗时应使用耗时总量的 rate 除以观察次数的 rate。
+
 周期性追加 JSONL 快照：
 
 ```bash
