@@ -37,12 +37,13 @@ const (
 
 // Metadata contains dimensions discovered from the startup packet and capture.
 type Metadata struct {
-	User            string `json:"user,omitempty"`
-	Database        string `json:"database,omitempty"`
+	User            string `json:"user"`
+	Database        string `json:"database"`
 	ApplicationName string `json:"application_name,omitempty"`
 	Client          string `json:"client,omitempty"`
 	ClientAddress   string `json:"client_address,omitempty"`
 	ClientPort      uint16 `json:"client_port,omitempty"`
+	StartupObserved bool   `json:"-"`
 }
 
 // Command describes one CommandComplete response associated with a query.
@@ -304,37 +305,49 @@ func (s *Session) consumeStartup(data []byte, startedAt, completedAt time.Time) 
 	case cancelRequest:
 		// CancelRequest is a complete, standalone startup-style packet.
 	case protocolVersion3:
+		metadata, err := parseStartupParameters(data[8:length], s.metadata)
+		if err != nil {
+			return 0, err
+		}
 		s.startupDone = true
-		s.parseStartupParameters(data[8:length])
+		s.metadata = metadata
 	default:
 		return 0, fmt.Errorf("%w: unsupported startup code %d", errInvalidFrame, code)
 	}
 	return length, nil
 }
 
-func (s *Session) parseStartupParameters(payload []byte) {
+func parseStartupParameters(payload []byte, metadata Metadata) (Metadata, error) {
 	values := make([]string, 0, 8)
 	for len(payload) > 0 && payload[0] != 0 {
 		value, rest, ok := readCString(payload)
 		if !ok {
-			return
+			return Metadata{}, fmt.Errorf("%w: unterminated startup parameter", errInvalidFrame)
 		}
 		values = append(values, value)
 		payload = rest
 	}
+	if len(payload) == 0 || payload[0] != 0 || len(values)%2 != 0 {
+		return Metadata{}, fmt.Errorf("%w: malformed startup parameters", errInvalidFrame)
+	}
 	for i := 0; i+1 < len(values); i += 2 {
 		switch values[i] {
 		case "user":
-			s.metadata.User = values[i+1]
+			metadata.User = values[i+1]
 		case "database":
-			s.metadata.Database = values[i+1]
+			metadata.Database = values[i+1]
 		case "application_name":
-			s.metadata.ApplicationName = values[i+1]
+			metadata.ApplicationName = values[i+1]
 		}
 	}
-	if s.metadata.Database == "" {
-		s.metadata.Database = s.metadata.User
+	if metadata.User == "" {
+		return Metadata{}, fmt.Errorf("%w: startup message is missing user", errInvalidFrame)
 	}
+	if metadata.Database == "" {
+		metadata.Database = metadata.User
+	}
+	metadata.StartupObserved = true
+	return metadata, nil
 }
 
 func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
@@ -506,7 +519,13 @@ func (s *Session) handleBackend(typ byte, payload []byte, startedAt, completedAt
 		if len(s.pending) > 0 && s.pending[0].simple {
 			s.pending[0].commands = append(s.pending[0].commands, parseCommand(payload))
 		} else if operation, ok := s.consumeOperation(operationExecute); ok {
-			s.addCommand(operation.requestID, parseCommand(payload))
+			command := parseCommand(payload)
+			if !commandMatchesQuery(operation.query, command.Tag) {
+				s.finishSyncGroup(operation.syncGroup, completedAt, "command_tag_mismatch")
+				s.dropSyncGroupOperations(operation.syncGroup, false)
+				break
+			}
+			s.addCommand(operation.requestID, command)
 			s.finishRequest(operation.requestID, completedAt, "", "", "", "")
 		}
 	case 's': // PortalSuspended completes this Execute, but not the portal.
@@ -844,6 +863,32 @@ func commandHasRowCount(tag string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+func commandMatchesQuery(query, commandTag string) bool {
+	expected := expectedCommandTag(query)
+	if expected == "" || commandTag == "" || commandTag == "PORTAL SUSPENDED" {
+		return true
+	}
+	return expected == commandTag
+}
+
+// expectedCommandTag returns a tag only for statements whose PostgreSQL
+// CommandComplete tag can be determined safely from the first SQL token.
+// Ambiguous forms such as WITH, EXECUTE, and EXPLAIN are left unchecked.
+func expectedCommandTag(query string) string {
+	tokens := lexFingerprint(query)
+	if len(tokens) == 0 || tokens[0].kind != tokenWord {
+		return ""
+	}
+	switch tokens[0].text {
+	case "select", "insert", "update", "delete", "merge", "copy", "move", "fetch", "call":
+		return strings.ToUpper(tokens[0].text)
+	case "values", "table":
+		return "SELECT"
+	default:
+		return ""
 	}
 }
 

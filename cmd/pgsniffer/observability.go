@@ -236,7 +236,7 @@ func startRuntimeServices(ctx context.Context, cancel context.CancelFunc, cfg co
 				case <-ctx.Done():
 					return
 				case <-ticker.C:
-					if err := pgsql.WriteJSONLine(file, collector.Snapshot("max", cfg.topN)); err != nil {
+					if err := pgsql.WriteJSONLine(file, snapshotReport(collector, cfg.topN)); err != nil {
 						services.fail(fmt.Errorf("write periodic report: %w", err))
 						return
 					}
@@ -292,7 +292,7 @@ func healthHandler(w http.ResponseWriter, _ *http.Request) {
 func reportHandler(collector *pgsql.Collector, topN int) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
-		if err := pgsql.WriteJSON(w, collector.Snapshot("max", topN)); err != nil {
+		if err := pgsql.WriteJSON(w, snapshotReport(collector, topN)); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 		}
 	}

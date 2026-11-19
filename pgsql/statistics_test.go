@@ -3,6 +3,7 @@ package pgsql
 import (
 	"bytes"
 	"encoding/json"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -38,6 +39,9 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if len(report.Queries) != 1 || !strings.Contains(report.Queries[0].Query, "pg_sleep") || report.Queries[0].Fingerprint != "" {
 		t.Fatalf("report = %+v", report)
 	}
+	if report.SchemaVersion != ReportSchemaVersion {
+		t.Fatalf("schema version = %d", report.SchemaVersion)
+	}
 
 	var table bytes.Buffer
 	if err := WriteTable(&table, report); err != nil {
@@ -51,7 +55,7 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if err := WriteJSON(&encoded, report); err != nil {
 		t.Fatal(err)
 	}
-	if output := encoded.String(); !strings.Contains(output, `"query": "SELECT pg_sleep(1)"`) || strings.Contains(output, `"fingerprint"`) || !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
+	if output := encoded.String(); !strings.Contains(output, `"schema_version": 2`) || !strings.Contains(output, `"query": "SELECT pg_sleep(1)"`) || strings.Contains(output, `"fingerprint"`) || !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
 		t.Fatalf("unexpected JSON schema: %s", output)
 	}
 	var decoded Report
@@ -70,6 +74,52 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 		!strings.Contains(metrics.String(), "pgsniffer_query_duration_observations_total") ||
 		!strings.Contains(metrics.String(), "pg_sleep") {
 		t.Fatalf("metrics = %q", metrics.String())
+	}
+}
+
+func TestCollectorReportsDimensionAvailability(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.Add(Event{Query: "SELECT 1", Duration: time.Millisecond, Metadata: Metadata{ClientAddress: "127.0.0.1"}})
+	collector.Add(Event{Query: "SELECT 1", Duration: time.Millisecond, Metadata: Metadata{
+		User: "alice", Database: "app", ClientAddress: "127.0.0.1", StartupObserved: true,
+	}})
+
+	report := collector.Snapshot("max", 0)
+	if len(report.Queries) != 2 {
+		t.Fatalf("queries = %+v", report.Queries)
+	}
+	var missing, complete *Summary
+	for index := range report.Queries {
+		if report.Queries[index].DimensionStatus.StartupObserved {
+			complete = &report.Queries[index]
+		} else {
+			missing = &report.Queries[index]
+		}
+	}
+	if missing == nil || !slices.Equal(missing.DimensionStatus.Missing, []string{"user", "database"}) {
+		t.Fatalf("missing dimensions = %+v", missing)
+	}
+	if complete == nil || len(complete.DimensionStatus.Missing) != 0 || complete.Dimensions.User != "alice" || complete.Dimensions.Database != "app" {
+		t.Fatalf("complete dimensions = %+v", complete)
+	}
+	data, err := json.Marshal(missing)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output := string(data); !strings.Contains(output, `"user":""`) || !strings.Contains(output, `"database":""`) ||
+		!strings.Contains(output, `"dimension_status":{"startup_observed":false,"missing":["user","database"]}`) {
+		t.Fatalf("dimension JSON = %s", output)
+	}
+	completeData, err := json.Marshal(complete)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded Summary
+	if err := json.Unmarshal(completeData, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.DimensionStatus.StartupObserved || !decoded.Dimensions.StartupObserved {
+		t.Fatalf("decoded dimensions = %+v", decoded)
 	}
 }
 

@@ -127,6 +127,12 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 
 ```json
 {
+  "schema_version": 2,
+  "build": {
+    "version": "snapshot-cc5f307",
+    "revision": "cc5f307a1b2c",
+    "commit_time": "2026-11-19T02:45:00Z"
+  },
   "generated_at": "2026-11-16T10:30:00Z",
   "queries": [
     {
@@ -136,6 +142,9 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
         "database": "inventory",
         "application_name": "catalog-api",
         "client_address": "10.0.1.24"
+      },
+      "dimension_status": {
+        "startup_observed": true
       },
       "calls": 57,
       "errors": 0,
@@ -195,6 +204,8 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 
 | 字段 | 含义 |
 | --- | --- |
+| `schema_version` | JSON 报告格式版本，程序化读取报告时应使用该字段判断格式。 |
+| `build` | 生成报告的 pgsniffer 版本、源码 revision 和可选的提交时间。 |
 | `generated_at` | 生成当前累计报告快照的时间。 |
 | `queries` | 应用分组模式、维度、排序和 `--max-groups` 后的 SQL 分组。 |
 | `capture` | 抓包健康状态和数据完整性计数。 |
@@ -212,6 +223,8 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 | `dimensions.database` | PostgreSQL 启动报文中的数据库；客户端未指定时默认等于用户。 |
 | `dimensions.application_name` | 客户端提供的 `application_name`。 |
 | `dimensions.client_address` | 从抓取连接中观察到的客户端 IP 地址。 |
+| `dimension_status.startup_observed` | pgsniffer 是否解码到了该连接的 PostgreSQL StartupMessage。 |
+| `dimension_status.missing` | 可选，无法获得的维度列表；`user` 和 `database` 缺失时会输出空字符串，不再静默省略。 |
 | `calls` | 当前“SQL 与维度”分组中观察到的请求数量。 |
 | `errors` | 观察到 PostgreSQL 错误码或错误消息的请求数量。 |
 | `incomplete` | 未获得完整响应的请求数量，不计入 `latency_ms`。 |
@@ -256,7 +269,9 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 | `midstream_connections` | 在 TCP 握手完成之后才开始观察到的连接数。 |
 | `statistics_errors` | 读取抓包后端统计信息失败的次数。 |
 
-`incomplete_reasons` 可能包含 `connection_closed`、`capture_or_idle_timeout`、`tcp_gap`、`protocol_error`、`client_terminated`、`pending_limit`、`operation_limit`、`sync_without_completion` 和 `aborted_after_error`。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。
+`user` 和 `database` 来自 StartupMessage；完整观察到的 StartupMessage 如果缺少用户，会被当作畸形协议拒绝。如果 `startup_observed` 为 `false`，表示协议解码器是从后续带类型的前端消息开始的，即使 pgsniffer 进程本身已经启动；此时应检查所选网卡、服务端方向、抓包丢包，以及 pgsniffer 与 PostgreSQL 之间是否存在代理或已建立的上游连接。
+
+`incomplete_reasons` 可能包含 `connection_closed`、`capture_or_idle_timeout`、`tcp_gap`、`protocol_error`、`client_terminated`、`pending_limit`、`operation_limit`、`sync_without_completion`、`aborted_after_error` 和 `command_tag_mismatch`。最后一种情况表示 Extended Query 响应与关联 SQL 的命令类型冲突；pgsniffer 会停止归属当前 Sync Group，而不是把命令标签和耗时混入无关 SQL。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。
 
 启用 `--group-by raw-sql` 后，每条记录按完整原始 SQL 分组，并使用 `query` 字段替代 `fingerprint`：
 

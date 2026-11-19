@@ -32,6 +32,16 @@ func TestBuildVersionUsesReleaseVersion(t *testing.T) {
 	}
 }
 
+func TestSnapshotReportIncludesBuildIdentity(t *testing.T) {
+	previous := releaseVersion
+	releaseVersion = "v0.0.2"
+	t.Cleanup(func() { releaseVersion = previous })
+	report := snapshotReport(pgsql.NewCollector(10, false), 10)
+	if report.SchemaVersion != pgsql.ReportSchemaVersion || report.Build == nil || report.Build.Version != "v0.0.2" {
+		t.Fatalf("report = %+v", report)
+	}
+}
+
 func TestRunCaptureOfflinePCAP(t *testing.T) {
 	pcapPath := filepath.Join(t.TempDir(), "postgres.pcap")
 	file, err := os.Create(pcapPath)

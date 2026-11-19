@@ -54,8 +54,15 @@ func TestSessionSimpleQuerySplitAndCoalescedResponses(t *testing.T) {
 	if event.Duration != 19*time.Millisecond || !event.PhaseObserved || event.FirstResponse != 14*time.Millisecond || event.ResponseTransfer != 5*time.Millisecond {
 		t.Fatalf("timings = duration:%s first:%s transfer:%s observed:%t", event.Duration, event.FirstResponse, event.ResponseTransfer, event.PhaseObserved)
 	}
-	if event.Metadata.User != "alice" || event.Metadata.Database != "app" || event.Metadata.ApplicationName != "psql" {
+	if event.Metadata.User != "alice" || event.Metadata.Database != "app" || event.Metadata.ApplicationName != "psql" || !event.Metadata.StartupObserved {
 		t.Fatalf("metadata = %+v", event.Metadata)
+	}
+}
+
+func TestSessionRejectsStartupWithoutUser(t *testing.T) {
+	session := NewSession(1024, Metadata{}, nil)
+	if err := session.Feed(ClientToServer, startupPacket(map[string]string{"database": "app"}), time.Now()); err == nil {
+		t.Fatal("expected startup metadata error")
 	}
 }
 
@@ -209,6 +216,64 @@ func TestSessionCapturesCommandRowsAndTransactionContext(t *testing.T) {
 	}
 	if len(events) != 2 || events[1].TransactionStatus != "in_transaction" || events[1].Metadata.ApplicationName != "orders-worker" {
 		t.Fatalf("second event = %+v", events)
+	}
+}
+
+func TestSessionMarksExtendedCommandMismatchIncomplete(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(351, 0)
+	parse := message('P', append(append(cstring("statement"), cstring("SELECT 1")...), 0, 0))
+	bind := message('B', append(cstring("portal"), cstring("statement")...))
+	execute := message('E', append(cstring("portal"), 0, 0, 0, 0))
+	frontend := append(parse, bind...)
+	frontend = append(frontend, execute...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('1', nil), message('2', nil)...)
+	backend = append(backend, message('C', cstring("UPDATE 1"))...)
+	backend = append(backend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 || !events[0].Incomplete || events[0].IncompleteReason != "command_tag_mismatch" || len(events[0].Commands) != 0 {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+func TestSessionCommandMismatchDropsRemainingSyncGroup(t *testing.T) {
+	var events []Event
+	session := NewSession(4096, Metadata{}, func(event Event) { events = append(events, event) })
+	t0 := time.Unix(352, 0)
+	cycle := func(name, query string) []byte {
+		parse := message('P', append(append(cstring(name), cstring(query)...), 0, 0))
+		bind := message('B', append(cstring(name+"_portal"), cstring(name)...))
+		execute := message('E', append(cstring(name+"_portal"), 0, 0, 0, 0))
+		return append(append(parse, bind...), execute...)
+	}
+	frontend := append(cycle("first", "SELECT 1"), cycle("second", "UPDATE items SET value = 1")...)
+	frontend = append(frontend, message('S', nil)...)
+	if err := session.Feed(ClientToServer, frontend, t0); err != nil {
+		t.Fatal(err)
+	}
+	backend := append(message('1', nil), message('2', nil)...)
+	backend = append(backend, message('C', cstring("UPDATE 1"))...)
+	backend = append(backend, message('1', nil)...)
+	backend = append(backend, message('2', nil)...)
+	backend = append(backend, message('C', cstring("UPDATE 1"))...)
+	backend = append(backend, message('Z', []byte{'I'})...)
+	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("events = %+v", events)
+	}
+	for _, event := range events {
+		if !event.Incomplete || event.IncompleteReason != "command_tag_mismatch" || len(event.Commands) != 0 {
+			t.Fatalf("event = %+v", event)
+		}
 	}
 }
 

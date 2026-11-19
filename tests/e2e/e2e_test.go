@@ -61,12 +61,19 @@ type dockerResource struct {
 }
 
 type report struct {
+	SchemaVersion     int               `json:"schema_version"`
+	Build             buildInformation  `json:"build"`
 	GeneratedAt       time.Time         `json:"generated_at"`
 	Queries           []summary         `json:"queries"`
 	Capture           captureStatistics `json:"capture"`
 	EncryptedSessions uint64            `json:"encrypted_sessions"`
 	DecodeErrors      uint64            `json:"decode_errors"`
 	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+type buildInformation struct {
+	Version  string `json:"version"`
+	Revision string `json:"revision"`
 }
 
 type captureStatistics struct {
@@ -101,6 +108,12 @@ type summary struct {
 	IncompleteReasons   map[string]uint64 `json:"incomplete_reasons"`
 	Latency             latencyJSON       `json:"latency_ms"`
 	IncompleteDuration  phaseLatencyJSON  `json:"incomplete_observed_duration_ms"`
+	DimensionStatus     dimensionStatus   `json:"dimension_status"`
+}
+
+type dimensionStatus struct {
+	StartupObserved bool     `json:"startup_observed"`
+	Missing         []string `json:"missing"`
 }
 
 type latencyJSON struct {
@@ -376,7 +389,12 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 		client.extended(t, fmt.Sprintf("add_one_%d", i), fmt.Sprintf("add_portal_%d", i), "SELECT $1::int + 1", []string{strconv.Itoa(i)})
 	}
 	client.extendedError(t, "bad_math", "bad_math_portal", "SELECT $1::int / 0", []string{"1"}, "22012")
-	client.pipeline(t, []string{"SELECT lower('PIPELINE')", "SELECT upper('pipeline')"})
+	client.pipeline(t, []string{
+		"SELECT lower('PIPELINE')",
+		"SELECT upper('pipeline')",
+		"SELECT balance FROM e2e_account WHERE id = 1",
+		"UPDATE e2e_account SET balance = balance + 1 WHERE id = 1",
+	})
 	client.pipelineError(t, []string{"SELECT CAST('bad' AS integer)", "SELECT md5('skipped')"}, "22P02")
 	client.extended(t, "after_pipeline_error", "after_pipeline_error_portal", "SELECT current_schema()", nil)
 	client.close()
@@ -425,6 +443,8 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 		pgsql.Fingerprint("SELECT current_database()"):                                                {20, 0},
 		pgsql.Fingerprint("SELECT lower('PIPELINE')"):                                                 {1, 0},
 		pgsql.Fingerprint("SELECT upper('pipeline')"):                                                 {1, 0},
+		pgsql.Fingerprint("SELECT balance FROM e2e_account WHERE id = 1"):                             {1, 0},
+		pgsql.Fingerprint("UPDATE e2e_account SET balance = balance + 1 WHERE id = 1"):                {1, 0},
 		pgsql.Fingerprint("SELECT CAST('bad' AS integer)"):                                            {1, 1},
 		pgsql.Fingerprint("SELECT md5('skipped')"):                                                    {1, 0},
 		pgsql.Fingerprint("SELECT current_schema()"):                                                  {1, 0},
@@ -438,11 +458,18 @@ func (h *harness) testPlainAndReplay(t *testing.T) {
 	}
 	selectSummary := findSummary(t, live, pgsql.Fingerprint("SELECT 42"))
 	if selectSummary.Dimensions.User != "postgres" || selectSummary.Dimensions.Database != "postgres" ||
-		selectSummary.Dimensions.ApplicationName != "pgsniffer-e2e" || selectSummary.Dimensions.ClientAddress != "127.0.0.1" {
+		selectSummary.Dimensions.ApplicationName != "pgsniffer-e2e" || selectSummary.Dimensions.ClientAddress != "127.0.0.1" ||
+		!selectSummary.DimensionStatus.StartupObserved || len(selectSummary.DimensionStatus.Missing) != 0 {
 		t.Fatalf("unexpected query dimensions: %+v", selectSummary.Dimensions)
 	}
 	if selectSummary.CommandTags["SELECT"] != 1 || selectSummary.RowsAffected != 1 || selectSummary.TransactionStatuses["idle"] != 1 {
 		t.Fatalf("unexpected command details: %+v", selectSummary)
+	}
+	pipelineSelect := findSummary(t, live, pgsql.Fingerprint("SELECT balance FROM e2e_account WHERE id = 1"))
+	pipelineUpdate := findSummary(t, live, pgsql.Fingerprint("UPDATE e2e_account SET balance = balance + 1 WHERE id = 1"))
+	if pipelineSelect.CommandTags["SELECT"] != 1 || len(pipelineSelect.CommandTags) != 1 ||
+		pipelineUpdate.CommandTags["UPDATE"] != 1 || len(pipelineUpdate.CommandTags) != 1 {
+		t.Fatalf("pipeline command attribution mismatch: select=%+v update=%+v", pipelineSelect, pipelineUpdate)
 	}
 	errorSummary := findSummary(t, live, pgsql.Fingerprint("SELECT 1 / 0"))
 	if errorSummary.SQLStates["22012"] != 1 || errorSummary.Severities["ERROR"] != 1 {
@@ -757,6 +784,9 @@ func stopProcess(cmd *exec.Cmd, done <-chan error) {
 
 func (h *harness) assertHealthy(t *testing.T, got report) {
 	t.Helper()
+	if got.SchemaVersion != pgsql.ReportSchemaVersion || got.Build.Version == "" {
+		t.Fatalf("missing report identity: %+v", got)
+	}
 	if got.DecodeErrors != 0 || got.DroppedKeys != 0 || got.EncryptedSessions != 0 {
 		t.Fatalf("unhealthy report: %+v", got)
 	}

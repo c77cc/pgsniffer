@@ -127,6 +127,12 @@ Durations are reported in milliseconds:
 
 ```json
 {
+  "schema_version": 2,
+  "build": {
+    "version": "snapshot-cc5f307",
+    "revision": "cc5f307a1b2c",
+    "commit_time": "2026-11-19T02:45:00Z"
+  },
   "generated_at": "2026-11-16T10:30:00Z",
   "queries": [
     {
@@ -136,6 +142,9 @@ Durations are reported in milliseconds:
         "database": "inventory",
         "application_name": "catalog-api",
         "client_address": "10.0.1.24"
+      },
+      "dimension_status": {
+        "startup_observed": true
       },
       "calls": 57,
       "errors": 0,
@@ -195,6 +204,8 @@ Top-level fields:
 
 | Field | Meaning |
 | --- | --- |
+| `schema_version` | JSON report schema version. Use it when consuming reports programmatically. |
+| `build` | Version, source revision, and optional commit time of the pgsniffer executable that generated the report. |
 | `generated_at` | Time at which this cumulative report snapshot was generated. |
 | `queries` | SQL groups after applying the grouping mode, dimensions, sorting, and `--max-groups`. |
 | `capture` | Capture health and packet completeness counters. |
@@ -212,6 +223,8 @@ Fields in each `queries` entry:
 | `dimensions.database` | PostgreSQL startup database; defaults to the user when the client omits it. |
 | `dimensions.application_name` | Client `application_name`, when available. |
 | `dimensions.client_address` | Client IP address observed in the captured connection. |
+| `dimension_status.startup_observed` | Whether pgsniffer decoded this connection's PostgreSQL StartupMessage. |
+| `dimension_status.missing` | Optional list of unavailable dimensions. `user` and `database` are emitted as empty strings instead of being silently omitted. |
 | `calls` | Number of observed requests in this SQL-and-dimensions group. |
 | `errors` | Requests with an observed PostgreSQL error code or error message. |
 | `incomplete` | Requests that did not have a complete response. They are excluded from `latency_ms`. |
@@ -256,7 +269,9 @@ Fields in each `queries` entry:
 | `midstream_connections` | Connections first observed after their TCP handshake. |
 | `statistics_errors` | Failures while reading capture-backend statistics. |
 
-`incomplete_reasons` can include `connection_closed`, `capture_or_idle_timeout`, `tcp_gap`, `protocol_error`, `client_terminated`, `pending_limit`, `operation_limit`, `sync_without_completion`, and `aborted_after_error`. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete.
+`user` and `database` are taken from StartupMessage, and a fully observed StartupMessage without a user is rejected as malformed. If `startup_observed` is false, the protocol decoder began from a later typed frontend message even when the capture process itself was already running; check the selected interface, endpoint direction, capture drops, and whether a proxy or existing upstream connection sits between pgsniffer and PostgreSQL.
+
+`incomplete_reasons` can include `connection_closed`, `capture_or_idle_timeout`, `tcp_gap`, `protocol_error`, `client_terminated`, `pending_limit`, `operation_limit`, `sync_without_completion`, `aborted_after_error`, and `command_tag_mismatch`. The last value means an Extended Query response contradicted its associated SQL command; pgsniffer stops attributing that Sync group instead of mixing its command tags and latency into unrelated SQL. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete.
 
 With `--group-by raw-sql`, each entry is grouped by the exact original SQL and uses `query` instead of `fingerprint`:
 

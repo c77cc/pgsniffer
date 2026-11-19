@@ -235,7 +235,7 @@ func runMain() error {
 	defer stop()
 	collector := pgsql.NewCollector(maxQueryKeys, cfg.groupBy == groupByRawSQL)
 	captureErr := runCaptureWithServices(ctx, cfg, collector)
-	if err := pgsql.WriteJSON(os.Stdout, collector.Snapshot("max", cfg.topN)); err != nil {
+	if err := pgsql.WriteJSON(os.Stdout, snapshotReport(collector, cfg.topN)); err != nil {
 		return err
 	}
 	if errors.Is(captureErr, context.Canceled) {
@@ -524,24 +524,37 @@ func packetMatchesServer(network gopacket.NetworkLayer, tcp *layers.TCP, server 
 }
 
 func buildVersion() string {
-	version := releaseVersion
-	var revision string
+	build := currentBuildInformation()
+	if build.Revision != "" {
+		return strings.Join([]string{"pgsniffer", build.Version, build.Revision[:min(12, len(build.Revision))]}, " ")
+	}
+	return "pgsniffer " + build.Version
+}
+
+func currentBuildInformation() pgsql.BuildInformation {
+	build := pgsql.BuildInformation{Version: releaseVersion}
 	if info, ok := debug.ReadBuildInfo(); ok {
-		if version == "" {
-			version = info.Main.Version
+		if build.Version == "" {
+			build.Version = info.Main.Version
 		}
 		for _, setting := range info.Settings {
-			if setting.Key == "vcs.revision" {
-				revision = setting.Value
-				break
+			switch setting.Key {
+			case "vcs.revision":
+				build.Revision = setting.Value
+			case "vcs.time":
+				build.CommitTime = setting.Value
 			}
 		}
 	}
-	if version == "" || version == "(devel)" {
-		version = "devel"
+	if build.Version == "" || build.Version == "(devel)" {
+		build.Version = "devel"
 	}
-	if revision != "" {
-		return strings.Join([]string{"pgsniffer", version, revision[:min(12, len(revision))]}, " ")
-	}
-	return "pgsniffer " + version
+	return build
+}
+
+func snapshotReport(collector *pgsql.Collector, topN int) pgsql.Report {
+	report := collector.Snapshot("max", topN)
+	build := currentBuildInformation()
+	report.Build = &build
+	return report
 }

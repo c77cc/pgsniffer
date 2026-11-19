@@ -17,6 +17,9 @@ const histogramBuckets = 64
 
 const maxSQLInput = 64 << 10
 
+// ReportSchemaVersion identifies the JSON report contract.
+const ReportSchemaVersion = 2
+
 type latencyHistogram [histogramBuckets]uint64
 
 func (h *latencyHistogram) add(duration time.Duration) {
@@ -106,6 +109,7 @@ type queryKey struct {
 	database        string
 	applicationName string
 	clientAddress   string
+	startupObserved bool
 }
 
 // Summary is an immutable statistics snapshot suitable for table or JSON output.
@@ -132,6 +136,13 @@ type Summary struct {
 	FirstResponse              LatencyPhase
 	ResponseTransfer           LatencyPhase
 	IncompleteObservedDuration LatencyPhase
+	DimensionStatus            DimensionStatus
+}
+
+// DimensionStatus explains whether connection startup metadata was available.
+type DimensionStatus struct {
+	StartupObserved bool     `json:"startup_observed"`
+	Missing         []string `json:"missing,omitempty"`
 }
 
 // LatencyPhase contains aggregate timings for a response phase or observed duration.
@@ -171,6 +182,7 @@ type summaryJSON struct {
 	Fingerprint                string                    `json:"fingerprint,omitempty"`
 	Query                      string                    `json:"query,omitempty"`
 	Dimensions                 Metadata                  `json:"dimensions,omitempty"`
+	DimensionStatus            *DimensionStatus          `json:"dimension_status,omitempty"`
 	Calls                      uint64                    `json:"calls"`
 	Errors                     uint64                    `json:"errors"`
 	Incomplete                 uint64                    `json:"incomplete"`
@@ -199,6 +211,7 @@ func (s Summary) MarshalJSON() ([]byte, error) {
 			ResponseTransfer: phaseMilliseconds(s.ResponseTransfer),
 		},
 		IncompleteObservedDuration: optionalPhaseMilliseconds(s.IncompleteObservedDuration),
+		DimensionStatus:            &s.DimensionStatus,
 	})
 }
 
@@ -243,6 +256,12 @@ func (s *Summary) UnmarshalJSON(data []byte) error {
 		FirstResponse:       phaseDuration(value.Latency.FirstResponse),
 		ResponseTransfer:    phaseDuration(value.Latency.ResponseTransfer),
 	}
+	if value.DimensionStatus != nil {
+		s.DimensionStatus = *value.DimensionStatus
+		s.Dimensions.StartupObserved = s.DimensionStatus.StartupObserved
+	} else {
+		s.DimensionStatus = dimensionStatus(s.Dimensions)
+	}
 	if value.IncompleteObservedDuration != nil {
 		s.IncompleteObservedDuration = phaseDuration(*value.IncompleteObservedDuration)
 	}
@@ -268,12 +287,21 @@ func millisecondsDuration(milliseconds float64) time.Duration {
 }
 
 type Report struct {
+	SchemaVersion     int               `json:"schema_version"`
+	Build             *BuildInformation `json:"build,omitempty"`
 	GeneratedAt       time.Time         `json:"generated_at"`
 	Queries           []Summary         `json:"queries"`
 	Capture           CaptureStatistics `json:"capture"`
 	EncryptedSessions uint64            `json:"encrypted_sessions"`
 	DecodeErrors      uint64            `json:"decode_errors"`
 	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+// BuildInformation identifies the executable that produced a report.
+type BuildInformation struct {
+	Version    string `json:"version"`
+	Revision   string `json:"revision,omitempty"`
+	CommitTime string `json:"commit_time,omitempty"`
 }
 
 // CaptureStatistics exposes whether packet loss or stream gaps can affect the
@@ -347,6 +375,7 @@ func (c *Collector) Add(event Event) {
 	key := queryKey{
 		sql: aggregationSQL, user: dimensions.User, database: dimensions.Database,
 		applicationName: dimensions.ApplicationName, clientAddress: dimensions.ClientAddress,
+		startupObserved: dimensions.StartupObserved,
 	}
 	stats, found := c.queries[key]
 	if !found {
@@ -407,8 +436,19 @@ func (c *Collector) Add(event Event) {
 func aggregateDimensions(metadata Metadata) Metadata {
 	return Metadata{
 		User: metadata.User, Database: metadata.Database, ApplicationName: metadata.ApplicationName,
-		ClientAddress: metadata.ClientAddress,
+		ClientAddress: metadata.ClientAddress, StartupObserved: metadata.StartupObserved,
 	}
+}
+
+func dimensionStatus(metadata Metadata) DimensionStatus {
+	status := DimensionStatus{StartupObserved: metadata.StartupObserved}
+	if metadata.User == "" {
+		status.Missing = append(status.Missing, "user")
+	}
+	if metadata.Database == "" {
+		status.Missing = append(status.Missing, "database")
+	}
+	return status
 }
 
 func (c *Collector) AddDecodeError() {
@@ -466,7 +506,7 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 	defer c.mu.RUnlock()
 
 	report := Report{
-		GeneratedAt: time.Now(), EncryptedSessions: c.encryptedSessions,
+		SchemaVersion: ReportSchemaVersion, GeneratedAt: time.Now(), EncryptedSessions: c.encryptedSessions,
 		DecodeErrors: c.decodeErrors, DroppedKeys: c.droppedKeys, Capture: c.capture,
 		Queries: make([]Summary, 0, len(c.queries)),
 	}
@@ -482,7 +522,8 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 			P95: latency.P95, P99: latency.P99, Total: latency.Total,
 			LatencyObservations: latency.Observations,
 			FirstResponse:       stats.firstResponse.summary(), ResponseTransfer: stats.responseTransfer.summary(),
-			IncompleteObservedDuration: stats.incompleteDuration.summary()}
+			IncompleteObservedDuration: stats.incompleteDuration.summary(),
+			DimensionStatus:            dimensionStatus(stats.dimensions)}
 		if c.rawSQL {
 			summary.Query = stats.sql
 		} else {
@@ -528,7 +569,11 @@ func (s Summary) SQL() string {
 }
 
 func dimensionsKey(metadata Metadata) string {
-	return strings.Join([]string{metadata.User, metadata.Database, metadata.ApplicationName, metadata.ClientAddress}, "\x00")
+	startup := "0"
+	if metadata.StartupObserved {
+		startup = "1"
+	}
+	return strings.Join([]string{metadata.User, metadata.Database, metadata.ApplicationName, metadata.ClientAddress, startup}, "\x00")
 }
 
 func cloneCounts(source map[string]uint64) map[string]uint64 {
