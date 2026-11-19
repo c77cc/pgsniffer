@@ -4,6 +4,21 @@ PgSniffer passively analyzes PostgreSQL traffic. It reassembles TCP streams, und
 
 [中文文档](README_CN.md)
 
+## Table of contents
+
+- [Features](#features)
+- [Install](#install)
+- [Quick start](#quick-start)
+- [Command-line options](#command-line-options)
+- [Long-running observability](#long-running-observability)
+  - [PromQL examples](#promql-examples)
+- [Output](#output)
+- [Timing semantics](#timing-semantics)
+- [SQL fingerprint semantics](#sql-fingerprint-semantics)
+- [Limitations and security](#limitations-and-security)
+- [Build from source](#build-from-source)
+- [License](#license)
+
 ## Features
 
 - Live capture and offline PCAP analysis using packet timestamps.
