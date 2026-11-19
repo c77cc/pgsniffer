@@ -238,7 +238,8 @@ func TestSessionMarksExtendedCommandMismatchIncomplete(t *testing.T) {
 	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 1 || !events[0].Incomplete || events[0].IncompleteReason != "command_tag_mismatch" || len(events[0].Commands) != 0 {
+	if len(events) != 1 || !events[0].Incomplete || events[0].IncompleteReason != "command_tag_mismatch" || len(events[0].Commands) != 0 ||
+		events[0].ProtocolIssue != "execute_command_tag_mismatch" || events[0].ExpectedCommand != "SELECT" || events[0].ActualCommand != "UPDATE" {
 		t.Fatalf("events = %+v", events)
 	}
 }
@@ -270,10 +271,9 @@ func TestSessionCommandMismatchDropsRemainingSyncGroup(t *testing.T) {
 	if len(events) != 2 {
 		t.Fatalf("events = %+v", events)
 	}
-	for _, event := range events {
-		if !event.Incomplete || event.IncompleteReason != "command_tag_mismatch" || len(event.Commands) != 0 {
-			t.Fatalf("event = %+v", event)
-		}
+	if events[0].IncompleteReason != "command_tag_mismatch" || events[0].ProtocolIssue != "execute_command_tag_mismatch" ||
+		events[1].IncompleteReason != "aborted_after_mismatch" {
+		t.Fatalf("events = %+v", events)
 	}
 }
 
@@ -550,7 +550,7 @@ func TestSessionUnnamedParseInvalidatesUnnamedPortal(t *testing.T) {
 	if err := session.Feed(ServerToClient, backend, t0.Add(time.Millisecond)); err != nil {
 		t.Fatal(err)
 	}
-	if len(events) != 0 {
+	if len(events) != 1 || events[0].ProtocolIssue != "execute_unknown_portal" || events[0].Query != "" {
 		t.Fatalf("stale unnamed portal was attributed to a query: %+v", events)
 	}
 }

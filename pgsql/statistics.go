@@ -18,7 +18,9 @@ const histogramBuckets = 64
 const maxSQLInput = 64 << 10
 
 // ReportSchemaVersion identifies the JSON report contract.
-const ReportSchemaVersion = 2
+const ReportSchemaVersion = 3
+
+const maxReliableTCPGapBytes = 16 << 20
 
 type latencyHistogram [histogramBuckets]uint64
 
@@ -292,9 +294,21 @@ type Report struct {
 	GeneratedAt       time.Time         `json:"generated_at"`
 	Queries           []Summary         `json:"queries"`
 	Capture           CaptureStatistics `json:"capture"`
+	DataQuality       DataQuality       `json:"data_quality"`
+	ProtocolIssues    map[string]uint64 `json:"protocol_issues,omitempty"`
 	EncryptedSessions uint64            `json:"encrypted_sessions"`
 	DecodeErrors      uint64            `json:"decode_errors"`
 	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+// DataQuality reports exactly which observed queries were included in latency
+// statistics and which were excluded because their protocol attribution was
+// incomplete.
+type DataQuality struct {
+	CompletedQueries       uint64  `json:"completed_queries"`
+	ExcludedQueries        uint64  `json:"excluded_queries"`
+	ExcludedPercentage     float64 `json:"excluded_percentage"`
+	MetadataMissingQueries uint64  `json:"metadata_missing_queries"`
 }
 
 // BuildInformation identifies the executable that produced a report.
@@ -307,17 +321,22 @@ type BuildInformation struct {
 // CaptureStatistics exposes whether packet loss or stream gaps can affect the
 // completeness of a report.
 type CaptureStatistics struct {
-	PacketsSeen             uint64 `json:"packets_seen"`
-	PacketsMatched          uint64 `json:"packets_matched"`
-	BytesCaptured           uint64 `json:"bytes_captured"`
-	TruncatedPackets        uint64 `json:"truncated_packets"`
-	KernelPacketsReceived   uint64 `json:"kernel_packets_received"`
-	KernelPacketsDropped    uint64 `json:"kernel_packets_dropped"`
-	InterfacePacketsDropped uint64 `json:"interface_packets_dropped"`
-	TCPGapEvents            uint64 `json:"tcp_gap_events"`
-	TCPBytesSkipped         uint64 `json:"tcp_bytes_skipped"`
-	MidstreamConnections    uint64 `json:"midstream_connections"`
-	StatisticsErrors        uint64 `json:"statistics_errors"`
+	PacketsSeen                  uint64 `json:"packets_seen"`
+	PacketsMatched               uint64 `json:"packets_matched"`
+	BytesCaptured                uint64 `json:"bytes_captured"`
+	TruncatedPackets             uint64 `json:"truncated_packets"`
+	KernelPacketsReceived        uint64 `json:"kernel_packets_received"`
+	KernelPacketsDropped         uint64 `json:"kernel_packets_dropped"`
+	InterfacePacketsDropped      uint64 `json:"interface_packets_dropped"`
+	TCPGapEvents                 uint64 `json:"tcp_gap_events"`
+	TCPBytesSkipped              uint64 `json:"tcp_bytes_skipped"`
+	TCPSequenceDiscontinuities   uint64 `json:"tcp_sequence_discontinuities"`
+	LargestTCPGapBytes           uint64 `json:"largest_tcp_gap_bytes"`
+	ConnectionsObserved          uint64 `json:"connections_observed"`
+	StartupObservedConnections   uint64 `json:"startup_observed_connections"`
+	MidstreamConnections         uint64 `json:"midstream_connections"`
+	ProtocolStateLossConnections uint64 `json:"protocol_state_loss_connections"`
+	StatisticsErrors             uint64 `json:"statistics_errors"`
 }
 
 // Collector keeps bounded aggregate state. It never stores individual latency
@@ -333,6 +352,8 @@ type Collector struct {
 	decodeErrors      uint64
 	droppedKeys       uint64
 	capture           CaptureStatistics
+	dataQuality       DataQuality
+	protocolIssues    map[string]uint64
 }
 
 func NewCollector(maxQueries int, rawSQL bool) *Collector {
@@ -341,6 +362,7 @@ func NewCollector(maxQueries int, rawSQL bool) *Collector {
 	}
 	return &Collector{
 		queries: make(map[queryKey]*queryStats), maxQueries: maxQueries, rawSQL: rawSQL,
+		protocolIssues: make(map[string]uint64),
 	}
 }
 
@@ -352,8 +374,23 @@ func (c *Collector) Add(event Event) {
 		c.encryptedSessions++
 		return
 	}
+	if event.ProtocolIssue != "" {
+		issue := event.ProtocolIssue
+		if event.ExpectedCommand != "" || event.ActualCommand != "" {
+			issue = fmt.Sprintf("%s_expected_%s_actual_%s", issue, event.ExpectedCommand, event.ActualCommand)
+		}
+		c.protocolIssues[issue]++
+	}
 	if event.Query == "" {
 		return
+	}
+	if event.Metadata.User == "" || event.Metadata.Database == "" {
+		c.dataQuality.MetadataMissingQueries++
+	}
+	if event.Incomplete {
+		c.dataQuality.ExcludedQueries++
+	} else {
+		c.dataQuality.CompletedQueries++
 	}
 	query := event.Query
 	truncated := false
@@ -491,13 +528,39 @@ func (c *Collector) AddTCPGap(skipped int) {
 	defer c.mu.Unlock()
 	c.capture.TCPGapEvents++
 	if skipped > 0 {
-		c.capture.TCPBytesSkipped += uint64(skipped)
+		value := uint64(skipped)
+		if value > c.capture.LargestTCPGapBytes {
+			c.capture.LargestTCPGapBytes = value
+		}
+		if skipped > maxReliableTCPGapBytes {
+			c.capture.TCPSequenceDiscontinuities++
+			return
+		}
+		c.capture.TCPBytesSkipped += value
 	}
+}
+
+func (c *Collector) AddObservedConnection() {
+	c.mu.Lock()
+	c.capture.ConnectionsObserved++
+	c.mu.Unlock()
+}
+
+func (c *Collector) AddStartupObservedConnection() {
+	c.mu.Lock()
+	c.capture.StartupObservedConnections++
+	c.mu.Unlock()
 }
 
 func (c *Collector) AddMidstreamConnection() {
 	c.mu.Lock()
 	c.capture.MidstreamConnections++
+	c.mu.Unlock()
+}
+
+func (c *Collector) AddProtocolStateLossConnection() {
+	c.mu.Lock()
+	c.capture.ProtocolStateLossConnections++
 	c.mu.Unlock()
 }
 
@@ -508,7 +571,12 @@ func (c *Collector) Snapshot(sortBy string, topN int) Report {
 	report := Report{
 		SchemaVersion: ReportSchemaVersion, GeneratedAt: time.Now(), EncryptedSessions: c.encryptedSessions,
 		DecodeErrors: c.decodeErrors, DroppedKeys: c.droppedKeys, Capture: c.capture,
+		DataQuality: c.dataQuality, ProtocolIssues: cloneCounts(c.protocolIssues),
 		Queries: make([]Summary, 0, len(c.queries)),
+	}
+	totalQualityQueries := report.DataQuality.CompletedQueries + report.DataQuality.ExcludedQueries
+	if totalQualityQueries > 0 {
+		report.DataQuality.ExcludedPercentage = math.Round(float64(report.DataQuality.ExcludedQueries)*10000/float64(totalQualityQueries)) / 100
 	}
 	for _, stats := range c.queries {
 		latency := stats.latency.summary()
@@ -588,8 +656,10 @@ func cloneCounts(source map[string]uint64) map[string]uint64 {
 }
 
 func WriteTable(w io.Writer, report Report) error {
-	if _, err := fmt.Fprintf(w, "queries=%d packets=%d matched=%d kernel_drops=%d interface_drops=%d tcp_gaps=%d truncated=%d encrypted_sessions=%d decode_errors=%d dropped_keys=%d\n",
-		len(report.Queries), report.Capture.PacketsSeen, report.Capture.PacketsMatched,
+	if _, err := fmt.Fprintf(w, "queries=%d completed=%d excluded=%d packets=%d matched=%d connections=%d midstream=%d state_loss=%d kernel_drops=%d interface_drops=%d tcp_gaps=%d truncated=%d encrypted_sessions=%d decode_errors=%d dropped_keys=%d\n",
+		len(report.Queries), report.DataQuality.CompletedQueries, report.DataQuality.ExcludedQueries,
+		report.Capture.PacketsSeen, report.Capture.PacketsMatched,
+		report.Capture.ConnectionsObserved, report.Capture.MidstreamConnections, report.Capture.ProtocolStateLossConnections,
 		report.Capture.KernelPacketsDropped, report.Capture.InterfacePacketsDropped,
 		report.Capture.TCPGapEvents, report.Capture.TruncatedPackets,
 		report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys); err != nil {
@@ -658,11 +728,28 @@ func WritePrometheus(w io.Writer, report Report) error {
 			return err
 		}
 	}
-	_, err := fmt.Fprintf(w, "pgsniffer_capture_packets_total %d\npgsniffer_capture_matched_packets_total %d\npgsniffer_capture_kernel_drops_total %d\npgsniffer_capture_interface_drops_total %d\npgsniffer_tcp_gap_events_total %d\npgsniffer_tcp_skipped_bytes_total %d\npgsniffer_encrypted_sessions_total %d\npgsniffer_decode_errors_total %d\npgsniffer_overflow_events_total %d\n",
+	if _, err := fmt.Fprintf(w, "pgsniffer_capture_packets_total %d\npgsniffer_capture_matched_packets_total %d\npgsniffer_capture_kernel_drops_total %d\npgsniffer_capture_interface_drops_total %d\npgsniffer_tcp_gap_events_total %d\npgsniffer_tcp_skipped_bytes_total %d\npgsniffer_tcp_sequence_discontinuities_total %d\npgsniffer_connections_observed_total %d\npgsniffer_connections_startup_observed_total %d\npgsniffer_connections_midstream_total %d\npgsniffer_connections_protocol_state_loss_total %d\npgsniffer_completed_queries_total %d\npgsniffer_excluded_queries_total %d\npgsniffer_metadata_missing_queries_total %d\npgsniffer_encrypted_sessions_total %d\npgsniffer_decode_errors_total %d\npgsniffer_overflow_events_total %d\n",
 		report.Capture.PacketsSeen, report.Capture.PacketsMatched, report.Capture.KernelPacketsDropped,
 		report.Capture.InterfacePacketsDropped, report.Capture.TCPGapEvents, report.Capture.TCPBytesSkipped,
-		report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys)
-	return err
+		report.Capture.TCPSequenceDiscontinuities, report.Capture.ConnectionsObserved,
+		report.Capture.StartupObservedConnections, report.Capture.MidstreamConnections,
+		report.Capture.ProtocolStateLossConnections, report.DataQuality.CompletedQueries,
+		report.DataQuality.ExcludedQueries, report.DataQuality.MetadataMissingQueries,
+		report.EncryptedSessions, report.DecodeErrors, report.DroppedKeys); err != nil {
+		return err
+	}
+	issues := make([]string, 0, len(report.ProtocolIssues))
+	for issue := range report.ProtocolIssues {
+		issues = append(issues, issue)
+	}
+	sort.Strings(issues)
+	for _, issue := range issues {
+		count := report.ProtocolIssues[issue]
+		if _, err := fmt.Fprintf(w, "pgsniffer_protocol_issues_total{issue=\"%s\"} %d\n", prometheusLabel(issue), count); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func prometheusLabel(value string) string {

@@ -392,6 +392,29 @@ func TestReassemblyCompleteUsesConnectionCloseTimestamp(t *testing.T) {
 	}
 }
 
+func TestAcceptClassifiesMidstreamFromFirstTCPPacket(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		tcp           layers.TCP
+		wantMidstream uint64
+	}{
+		{name: "client syn", tcp: layers.TCP{SYN: true}, wantMidstream: 0},
+		{name: "syn ack", tcp: layers.TCP{SYN: true, ACK: true}, wantMidstream: 1},
+		{name: "data first", tcp: layers.TCP{ACK: true, PSH: true}, wantMidstream: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			collector := pgsql.NewCollector(10, false)
+			stream := &pgStream{collector: collector, session: pgsql.NewSession(1024, pgsql.Metadata{}, collector.Add)}
+			start := false
+			stream.Accept(&test.tcp, gopacket.CaptureInfo{}, reassembly.TCPDirClientToServer, 0, &start, nil)
+			stream.Accept(&layers.TCP{ACK: true}, gopacket.CaptureInfo{}, reassembly.TCPDirClientToServer, 0, &start, nil)
+			if got := collector.Snapshot("max", 0).Capture.MidstreamConnections; got != test.wantMidstream {
+				t.Fatalf("midstream connections = %d, want %d", got, test.wantMidstream)
+			}
+		})
+	}
+}
+
 func captureInfo(timestamp time.Time, payloadLength int) gopacket.CaptureInfo {
 	packetLength := 14 + 20 + 20 + payloadLength
 	return gopacket.CaptureInfo{Timestamp: timestamp, CaptureLength: packetLength, Length: packetLength}

@@ -70,6 +70,9 @@ type Event struct {
 	Encrypted         bool          `json:"encrypted,omitempty"`
 	Incomplete        bool          `json:"incomplete,omitempty"`
 	IncompleteReason  string        `json:"incomplete_reason,omitempty"`
+	ProtocolIssue     string        `json:"protocol_issue,omitempty"`
+	ExpectedCommand   string        `json:"expected_command,omitempty"`
+	ActualCommand     string        `json:"actual_command,omitempty"`
 }
 
 type timedBuffer struct {
@@ -94,6 +97,9 @@ type pendingRequest struct {
 	errorCode         string
 	errorInfo         string
 	severity          string
+	protocolIssue     string
+	expectedCommand   string
+	actualCommand     string
 }
 
 type operationKind byte
@@ -395,6 +401,9 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 			return
 		}
 		query, statementFound := s.statements[statementName]
+		if !statementFound {
+			s.emitProtocolIssue("bind_unknown_statement", at)
+		}
 		previousPortal, previousFound := s.portals[portalName]
 		mutated := false
 		if statementFound && (previousFound || len(s.portals) < maxPreparedObjects) {
@@ -434,6 +443,9 @@ func (s *Session) handleFrontend(typ byte, payload []byte, at time.Time) {
 				query: bound.query, startedAt: at, metadata: s.metadata,
 				transactionStatus: s.transactionStatus, syncGroup: s.frontendSyncGroup,
 			})
+		}
+		if _, found := s.portals[portalName]; !found {
+			s.emitProtocolIssue("execute_unknown_portal", at)
 		}
 		query := ""
 		if bound, found := s.portals[portalName]; found {
@@ -521,7 +533,9 @@ func (s *Session) handleBackend(typ byte, payload []byte, startedAt, completedAt
 		} else if operation, ok := s.consumeOperation(operationExecute); ok {
 			command := parseCommand(payload)
 			if !commandMatchesQuery(operation.query, command.Tag) {
-				s.finishSyncGroup(operation.syncGroup, completedAt, "command_tag_mismatch")
+				s.setProtocolMismatch(operation.requestID, expectedCommandTag(operation.query), command.Tag)
+				s.finishRequest(operation.requestID, completedAt, "", "", "", "command_tag_mismatch")
+				s.finishSyncGroup(operation.syncGroup, completedAt, "aborted_after_mismatch")
 				s.dropSyncGroupOperations(operation.syncGroup, false)
 				break
 			}
@@ -644,6 +658,21 @@ func (s *Session) addCommand(requestID uint64, command Command) {
 			return
 		}
 	}
+}
+
+func (s *Session) setProtocolMismatch(requestID uint64, expected, actual string) {
+	for index := range s.pending {
+		if s.pending[index].id == requestID {
+			s.pending[index].protocolIssue = "execute_command_tag_mismatch"
+			s.pending[index].expectedCommand = expected
+			s.pending[index].actualCommand = actual
+			return
+		}
+	}
+}
+
+func (s *Session) emitProtocolIssue(issue string, at time.Time) {
+	s.emit(Event{FinishedAt: at, Metadata: s.metadata, ProtocolIssue: issue})
 }
 
 func (s *Session) markFirstResponse(requestID uint64, at time.Time) {
@@ -769,7 +798,17 @@ func (s *Session) finishAt(index int, at time.Time, code, message, severity, inc
 		Severity: severity, Metadata: pending.metadata, Commands: pending.commands,
 		TransactionStatus: pending.transactionStatus,
 		Incomplete:        incompleteReason != "", IncompleteReason: incompleteReason,
+		ProtocolIssue: pending.protocolIssue, ExpectedCommand: pending.expectedCommand,
+		ActualCommand: pending.actualCommand,
 	})
+}
+
+// StartupObserved reports whether this session decoded a PostgreSQL startup
+// message. It is used for connection-level capture quality statistics.
+func (s *Session) StartupObserved() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.metadata.StartupObserved
 }
 
 func splitDuration(startedAt, firstResponseAt, finishedAt time.Time) (time.Duration, time.Duration, time.Duration) {

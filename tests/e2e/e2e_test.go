@@ -66,9 +66,18 @@ type report struct {
 	GeneratedAt       time.Time         `json:"generated_at"`
 	Queries           []summary         `json:"queries"`
 	Capture           captureStatistics `json:"capture"`
+	DataQuality       dataQuality       `json:"data_quality"`
+	ProtocolIssues    map[string]uint64 `json:"protocol_issues"`
 	EncryptedSessions uint64            `json:"encrypted_sessions"`
 	DecodeErrors      uint64            `json:"decode_errors"`
 	DroppedKeys       uint64            `json:"dropped_query_keys"`
+}
+
+type dataQuality struct {
+	CompletedQueries       uint64  `json:"completed_queries"`
+	ExcludedQueries        uint64  `json:"excluded_queries"`
+	ExcludedPercentage     float64 `json:"excluded_percentage"`
+	MetadataMissingQueries uint64  `json:"metadata_missing_queries"`
 }
 
 type buildInformation struct {
@@ -77,14 +86,19 @@ type buildInformation struct {
 }
 
 type captureStatistics struct {
-	PacketsSeen             uint64 `json:"packets_seen"`
-	PacketsMatched          uint64 `json:"packets_matched"`
-	TruncatedPackets        uint64 `json:"truncated_packets"`
-	KernelPacketsDropped    uint64 `json:"kernel_packets_dropped"`
-	InterfacePacketsDropped uint64 `json:"interface_packets_dropped"`
-	TCPGapEvents            uint64 `json:"tcp_gap_events"`
-	TCPBytesSkipped         uint64 `json:"tcp_bytes_skipped"`
-	StatisticsErrors        uint64 `json:"statistics_errors"`
+	PacketsSeen                  uint64 `json:"packets_seen"`
+	PacketsMatched               uint64 `json:"packets_matched"`
+	TruncatedPackets             uint64 `json:"truncated_packets"`
+	KernelPacketsDropped         uint64 `json:"kernel_packets_dropped"`
+	InterfacePacketsDropped      uint64 `json:"interface_packets_dropped"`
+	TCPGapEvents                 uint64 `json:"tcp_gap_events"`
+	TCPBytesSkipped              uint64 `json:"tcp_bytes_skipped"`
+	TCPSequenceDiscontinuities   uint64 `json:"tcp_sequence_discontinuities"`
+	ConnectionsObserved          uint64 `json:"connections_observed"`
+	StartupObservedConnections   uint64 `json:"startup_observed_connections"`
+	MidstreamConnections         uint64 `json:"midstream_connections"`
+	ProtocolStateLossConnections uint64 `json:"protocol_state_loss_connections"`
+	StatisticsErrors             uint64 `json:"statistics_errors"`
 }
 
 type dimensions struct {
@@ -792,8 +806,14 @@ func (h *harness) assertHealthy(t *testing.T, got report) {
 	}
 	if got.Capture.PacketsSeen == 0 || got.Capture.PacketsMatched == 0 || got.Capture.TruncatedPackets != 0 ||
 		got.Capture.KernelPacketsDropped != 0 || got.Capture.InterfacePacketsDropped != 0 ||
-		got.Capture.TCPGapEvents != 0 || got.Capture.TCPBytesSkipped != 0 || got.Capture.StatisticsErrors != 0 {
+		got.Capture.TCPGapEvents != 0 || got.Capture.TCPBytesSkipped != 0 || got.Capture.TCPSequenceDiscontinuities != 0 ||
+		got.Capture.ConnectionsObserved == 0 || got.Capture.StartupObservedConnections == 0 ||
+		got.Capture.ProtocolStateLossConnections != 0 || got.Capture.StatisticsErrors != 0 {
 		t.Fatalf("unhealthy capture statistics: %+v", got.Capture)
+	}
+	if got.DataQuality.CompletedQueries+got.DataQuality.ExcludedQueries == 0 ||
+		got.DataQuality.MetadataMissingQueries != 0 || len(got.ProtocolIssues) != 0 {
+		t.Fatalf("unhealthy data quality: quality=%+v issues=%+v", got.DataQuality, got.ProtocolIssues)
 	}
 }
 

@@ -55,7 +55,7 @@ func TestCollectorTopNAndWriters(t *testing.T) {
 	if err := WriteJSON(&encoded, report); err != nil {
 		t.Fatal(err)
 	}
-	if output := encoded.String(); !strings.Contains(output, `"schema_version": 2`) || !strings.Contains(output, `"query": "SELECT pg_sleep(1)"`) || strings.Contains(output, `"fingerprint"`) || !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
+	if output := encoded.String(); !strings.Contains(output, `"schema_version": 3`) || !strings.Contains(output, `"query": "SELECT pg_sleep(1)"`) || strings.Contains(output, `"fingerprint"`) || !strings.Contains(output, `"calls"`) || !strings.Contains(output, `"latency_ms"`) || strings.Contains(output, `"average_ns"`) {
 		t.Fatalf("unexpected JSON schema: %s", output)
 	}
 	var decoded Report
@@ -302,5 +302,41 @@ func TestCollectorGroupsDimensionsAndReportsExecutionDetails(t *testing.T) {
 		default:
 			t.Fatalf("unexpected dimensions: %+v", summary.Dimensions)
 		}
+	}
+}
+
+func TestCollectorReportsConnectionAndDataQualityDiagnostics(t *testing.T) {
+	collector := NewCollector(10, false)
+	collector.AddObservedConnection()
+	collector.AddStartupObservedConnection()
+	collector.AddMidstreamConnection()
+	collector.AddProtocolStateLossConnection()
+	collector.AddTCPGap(64)
+	collector.AddTCPGap(maxReliableTCPGapBytes + 1)
+	collector.Add(Event{
+		Query: "SELECT 1", Duration: time.Millisecond,
+		Metadata: Metadata{User: "alice", Database: "app", StartupObserved: true},
+	})
+	collector.Add(Event{
+		Query: "SELECT 2", Duration: time.Millisecond, Incomplete: true,
+		IncompleteReason: "command_tag_mismatch", ProtocolIssue: "execute_command_tag_mismatch",
+		ExpectedCommand: "SELECT", ActualCommand: "UPDATE",
+	})
+	collector.Add(Event{ProtocolIssue: "execute_unknown_portal"})
+
+	report := collector.Snapshot("max", 0)
+	if report.DataQuality.CompletedQueries != 1 || report.DataQuality.ExcludedQueries != 1 ||
+		report.DataQuality.ExcludedPercentage != 50 || report.DataQuality.MetadataMissingQueries != 1 {
+		t.Fatalf("data quality = %+v", report.DataQuality)
+	}
+	if report.ProtocolIssues["execute_command_tag_mismatch_expected_SELECT_actual_UPDATE"] != 1 ||
+		report.ProtocolIssues["execute_unknown_portal"] != 1 {
+		t.Fatalf("protocol issues = %+v", report.ProtocolIssues)
+	}
+	if report.Capture.ConnectionsObserved != 1 || report.Capture.StartupObservedConnections != 1 ||
+		report.Capture.MidstreamConnections != 1 || report.Capture.ProtocolStateLossConnections != 1 ||
+		report.Capture.TCPGapEvents != 2 || report.Capture.TCPBytesSkipped != 64 ||
+		report.Capture.TCPSequenceDiscontinuities != 1 || report.Capture.LargestTCPGapBytes != maxReliableTCPGapBytes+1 {
+		t.Fatalf("capture diagnostics = %+v", report.Capture)
 	}
 }

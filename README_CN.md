@@ -127,7 +127,7 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "build": {
     "version": "snapshot-cc5f307",
     "revision": "cc5f307a1b2c",
@@ -191,8 +191,19 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
     "interface_packets_dropped": 0,
     "tcp_gap_events": 0,
     "tcp_bytes_skipped": 0,
+    "tcp_sequence_discontinuities": 0,
+    "largest_tcp_gap_bytes": 0,
+    "connections_observed": 1,
+    "startup_observed_connections": 1,
     "midstream_connections": 0,
+    "protocol_state_loss_connections": 0,
     "statistics_errors": 0
+  },
+  "data_quality": {
+    "completed_queries": 57,
+    "excluded_queries": 0,
+    "excluded_percentage": 0,
+    "metadata_missing_queries": 0
   },
   "encrypted_sessions": 0,
   "decode_errors": 0,
@@ -209,6 +220,8 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 | `generated_at` | 生成当前累计报告快照的时间。 |
 | `queries` | 应用分组模式、维度、排序和 `--max-groups` 后的 SQL 分组。 |
 | `capture` | 抓包健康状态和数据完整性计数。 |
+| `data_quality` | 应用 `--max-groups` 截断之前，全局完整、排除和元数据缺失的查询计数。 |
+| `protocol_issues` | 可选的协议状态诊断聚合，包括预期和实际 command tag；不包含 SQL 文本。 |
 | `encrypted_sessions` | 已识别但无法解码的 TLS/GSS 会话数。 |
 | `decode_errors` | 数据包、TCP 流或 PostgreSQL 协议解码失败次数。 |
 | `dropped_query_keys` | 因有界聚合容量已满、无法接纳新的“SQL 与维度”键而被归入溢出组的查询事件数。 |
@@ -266,12 +279,19 @@ sudo ./pgsniffer --interface eth0 --server 10.0.0.8:5432 \
 | `interface_packets_dropped` | 网卡或抓包后端报告的丢包数。 |
 | `tcp_gap_events` | TCP 重组时发现捕获流中缺少字节的次数。 |
 | `tcp_bytes_skipped` | TCP 缺口累计跳过的字节数。 |
+| `tcp_sequence_discontinuities` | 超过安全统计上限的缺口，通常表示序列号不连续、四元组复用或抓包严重损坏；其不可信字节距离不会计入 `tcp_bytes_skipped`。 |
+| `largest_tcp_gap_bytes` | 观察到的最大 TCP 序列距离，包括不连续事件。 |
+| `connections_observed` | TCP 重组器创建的连接流数量。 |
+| `startup_observed_connections` | 成功解码 PostgreSQL StartupMessage 的连接数。 |
 | `midstream_connections` | 在 TCP 握手完成之后才开始观察到的连接数。 |
+| `protocol_state_loss_connections` | 因 TCP 缺口或 PostgreSQL 解码失败而停用的连接数；其后续流量不会再归属给 SQL。 |
 | `statistics_errors` | 读取抓包后端统计信息失败的次数。 |
+
+`data_quality.completed_queries` 是计入耗时统计的请求数；`excluded_queries` 是未完成并被排除的请求数；`excluded_percentage` 以完整与排除请求之和为分母；`metadata_missing_queries` 是缺少启动用户或数据库的请求数。这些计数覆盖全部已接纳事件，不受 `--max-groups` 影响。
 
 `user` 和 `database` 来自 StartupMessage；完整观察到的 StartupMessage 如果缺少用户，会被当作畸形协议拒绝。如果 `startup_observed` 为 `false`，表示协议解码器是从后续带类型的前端消息开始的，即使 pgsniffer 进程本身已经启动；此时应检查所选网卡、服务端方向、抓包丢包，以及 pgsniffer 与 PostgreSQL 之间是否存在代理或已建立的上游连接。
 
-`incomplete_reasons` 可能包含 `connection_closed`、`capture_or_idle_timeout`、`tcp_gap`、`protocol_error`、`client_terminated`、`pending_limit`、`operation_limit`、`sync_without_completion`、`aborted_after_error` 和 `command_tag_mismatch`。最后一种情况表示 Extended Query 响应与关联 SQL 的命令类型冲突；pgsniffer 会停止归属当前 Sync Group，而不是把命令标签和耗时混入无关 SQL。抓包丢包、截断包或 TCP 缺口非零时，报告可能不完整。
+`incomplete_reasons` 可能包含 `connection_closed`、`capture_or_idle_timeout`、`tcp_gap`、`protocol_error`、`client_terminated`、`pending_limit`、`operation_limit`、`sync_without_completion`、`aborted_after_error`、`command_tag_mismatch` 和 `aborted_after_mismatch`。命令标签冲突只标记预期与实际标签不一致的请求，同一 Sync Group 的其他请求会作为 aborted 排除。`protocol_issues` 还会统计未知 PreparedStatement 或 Portal，这通常出现在中途接入的连接。抓包丢包、截断包、TCP 缺口或协议状态丢失非零时，报告可能不完整。
 
 启用 `--group-by raw-sql` 后，每条记录按完整原始 SQL 分组，并使用 `query` 字段替代 `fingerprint`：
 

@@ -127,7 +127,7 @@ Durations are reported in milliseconds:
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "build": {
     "version": "snapshot-cc5f307",
     "revision": "cc5f307a1b2c",
@@ -191,8 +191,19 @@ Durations are reported in milliseconds:
     "interface_packets_dropped": 0,
     "tcp_gap_events": 0,
     "tcp_bytes_skipped": 0,
+    "tcp_sequence_discontinuities": 0,
+    "largest_tcp_gap_bytes": 0,
+    "connections_observed": 1,
+    "startup_observed_connections": 1,
     "midstream_connections": 0,
+    "protocol_state_loss_connections": 0,
     "statistics_errors": 0
+  },
+  "data_quality": {
+    "completed_queries": 57,
+    "excluded_queries": 0,
+    "excluded_percentage": 0,
+    "metadata_missing_queries": 0
   },
   "encrypted_sessions": 0,
   "decode_errors": 0,
@@ -209,6 +220,8 @@ Top-level fields:
 | `generated_at` | Time at which this cumulative report snapshot was generated. |
 | `queries` | SQL groups after applying the grouping mode, dimensions, sorting, and `--max-groups`. |
 | `capture` | Capture health and packet completeness counters. |
+| `data_quality` | Global completed, excluded, and metadata-missing query counts before `--max-groups` truncation. |
+| `protocol_issues` | Optional aggregate protocol-state diagnostics, including expected and actual command tags. It never contains SQL text. |
 | `encrypted_sessions` | TLS/GSS sessions detected but not decoded. |
 | `decode_errors` | Packet, TCP stream, or PostgreSQL protocol decode failures. |
 | `dropped_query_keys` | Query events routed to the bounded overflow group because a new SQL-and-dimensions key could not be admitted. |
@@ -266,12 +279,19 @@ Fields in each `queries` entry:
 | `interface_packets_dropped` | Packets reported dropped by the network interface or capture backend. |
 | `tcp_gap_events` | TCP reassembly gaps where bytes were missing from the captured stream. |
 | `tcp_bytes_skipped` | Number of bytes skipped across TCP gaps. |
+| `tcp_sequence_discontinuities` | Gaps larger than the safe accounting limit, usually indicating sequence discontinuity, tuple reuse, or severely damaged capture data. Their untrusted byte distance is not added to `tcp_bytes_skipped`. |
+| `largest_tcp_gap_bytes` | Largest observed TCP sequence distance, including discontinuities. |
+| `connections_observed` | TCP connection streams created by the reassembler. |
+| `startup_observed_connections` | Connections for which PostgreSQL StartupMessage was decoded. |
 | `midstream_connections` | Connections first observed after their TCP handshake. |
+| `protocol_state_loss_connections` | Connections disabled after a TCP gap or PostgreSQL decode failure. Their later traffic is not attributed to SQL. |
 | `statistics_errors` | Failures while reading capture-backend statistics. |
+
+`data_quality.completed_queries` is the number included in latency statistics. `excluded_queries` contains incomplete requests and `excluded_percentage` is calculated over completed plus excluded requests. `metadata_missing_queries` counts requests without a startup user or database. These counters cover all admitted events and are not reduced by `--max-groups`.
 
 `user` and `database` are taken from StartupMessage, and a fully observed StartupMessage without a user is rejected as malformed. If `startup_observed` is false, the protocol decoder began from a later typed frontend message even when the capture process itself was already running; check the selected interface, endpoint direction, capture drops, and whether a proxy or existing upstream connection sits between pgsniffer and PostgreSQL.
 
-`incomplete_reasons` can include `connection_closed`, `capture_or_idle_timeout`, `tcp_gap`, `protocol_error`, `client_terminated`, `pending_limit`, `operation_limit`, `sync_without_completion`, `aborted_after_error`, and `command_tag_mismatch`. The last value means an Extended Query response contradicted its associated SQL command; pgsniffer stops attributing that Sync group instead of mixing its command tags and latency into unrelated SQL. Nonzero capture drops, truncated packets, or TCP gaps mean the report may be incomplete.
+`incomplete_reasons` can include `connection_closed`, `capture_or_idle_timeout`, `tcp_gap`, `protocol_error`, `client_terminated`, `pending_limit`, `operation_limit`, `sync_without_completion`, `aborted_after_error`, `command_tag_mismatch`, and `aborted_after_mismatch`. A command mismatch identifies only the request whose expected and actual command tags conflict; other requests in that Sync Group are excluded as aborted. `protocol_issues` also reports unknown prepared statements or portals, which commonly occur on midstream connections. Nonzero capture drops, truncated packets, TCP gaps, or protocol-state loss mean the report may be incomplete.
 
 With `--group-by raw-sql`, each entry is grouped by the exact original SQL and uses `query` instead of `fingerprint`:
 

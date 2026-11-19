@@ -65,13 +65,17 @@ type pgStreamFactory struct {
 }
 
 type pgStream struct {
-	session       *pgsql.Session
-	collector     *pgsql.Collector
-	firstIsClient bool
-	logQueries    bool
-	lastSeen      time.Time
-	sawTCPClose   bool
-	sawMidstream  bool
+	session          *pgsql.Session
+	collector        *pgsql.Collector
+	firstIsClient    bool
+	logQueries       bool
+	lastSeen         time.Time
+	sawTCPClose      bool
+	sawMidstream     bool
+	sawFirstPacket   bool
+	startupCounted   bool
+	stateLossCounted bool
+	disabled         bool
 }
 
 func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reassembly.AssemblerContext) reassembly.Stream {
@@ -97,7 +101,9 @@ func (f *pgStreamFactory) New(netFlow, _ gopacket.Flow, tcp *layers.TCP, _ reass
 		collector: f.collector, firstIsClient: firstIsClient,
 		logQueries: f.logQueries,
 	}
+	f.collector.AddObservedConnection()
 	stream.session = pgsql.NewSession(pgsql.DefaultMaxFrameSize, metadata, func(event pgsql.Event) {
+		stream.markStartupObserved(event.Metadata.StartupObserved)
 		f.collector.Add(event)
 		if event.Encrypted {
 			f.tlsOnce.Do(func() { f.notifyEvent(captureEventEncrypted) })
@@ -133,6 +139,15 @@ func logCompletedQuery(event pgsql.Event) {
 func (s *pgStream) Accept(tcp *layers.TCP, info gopacket.CaptureInfo, _ reassembly.TCPFlowDirection, _ reassembly.Sequence, start *bool, _ reassembly.AssemblerContext) bool {
 	// Passive capture commonly starts after the TCP handshake.
 	*start = true
+	if !s.sawFirstPacket {
+		s.sawFirstPacket = true
+		// Only a client SYN without ACK proves that the complete connection
+		// lifetime was observed. SYN-ACK and data-first streams are midstream.
+		if !tcp.SYN || tcp.ACK {
+			s.sawMidstream = true
+			s.collector.AddMidstreamConnection()
+		}
+	}
 	if tcp.FIN || tcp.RST {
 		s.sawTCPClose = true
 	}
@@ -163,10 +178,13 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	if skip > 0 {
 		s.collector.AddTCPGap(skip)
 		s.collector.AddDecodeError()
+		s.markProtocolStateLoss()
 		s.session.Gap(info.Timestamp)
-	} else if skip < 0 && !s.sawMidstream {
-		s.sawMidstream = true
-		s.collector.AddMidstreamConnection()
+		s.disabled = true
+		return
+	}
+	if s.disabled {
+		return
 	}
 
 	clientToServer := direction == reassembly.TCPDirClientToServer
@@ -179,10 +197,28 @@ func (s *pgStream) ReassembledSG(sg reassembly.ScatterGather, _ reassembly.Assem
 	}
 	if err := s.session.FeedSpan(pgDirection, data, info.Timestamp, completedInfo.Timestamp); err != nil {
 		s.collector.AddDecodeError()
+		s.markProtocolStateLoss()
 		s.session.Abort(info.Timestamp)
+		s.disabled = true
 		if s.logQueries {
 			log.Printf("discarding malformed PostgreSQL stream data: %v", err)
 		}
+		return
+	}
+	s.markStartupObserved(s.session.StartupObserved())
+}
+
+func (s *pgStream) markStartupObserved(observed bool) {
+	if observed && !s.startupCounted {
+		s.startupCounted = true
+		s.collector.AddStartupObservedConnection()
+	}
+}
+
+func (s *pgStream) markProtocolStateLoss() {
+	if !s.stateLossCounted {
+		s.stateLossCounted = true
+		s.collector.AddProtocolStateLossConnection()
 	}
 }
 
