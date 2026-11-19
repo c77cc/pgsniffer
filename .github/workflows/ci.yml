@@ -68,7 +68,7 @@ jobs:
           PGSNIFFER_E2E_SETCAP: "1"
           PGSNIFFER_E2E_ARTIFACTS: .artifacts/e2e/postgres-${{ matrix.postgres }}
           PGSNIFFER_E2E_REAL_CLIENTS: ${{ matrix.postgres == '16' && '1' || '0' }}
-        run: go test -tags=e2e ./tests/e2e -run TestDockerEndToEnd -v -count=1
+        run: go test -tags=e2e ./tests/e2e -v -count=1
       - name: Upload failed E2E artifacts
         if: failure()
         uses: actions/upload-artifact@v6

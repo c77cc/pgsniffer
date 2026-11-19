@@ -151,6 +151,24 @@ func TestDockerEndToEnd(t *testing.T) {
 	t.Run("server_interruption", h.testInterruption)
 }
 
+func TestRunOutputKeepsStderrSeparate(t *testing.T) {
+	t.Setenv("PGSNIFFER_E2E_OUTPUT_HELPER", "1")
+	h := &harness{}
+	got := h.runOutput(t, "", os.Args[0], "-test.run=^TestRunOutputHelper$")
+	if got != "stdout-only" {
+		t.Fatalf("runOutput() = %q, want stdout only", got)
+	}
+}
+
+func TestRunOutputHelper(t *testing.T) {
+	if os.Getenv("PGSNIFFER_E2E_OUTPUT_HELPER") != "1" {
+		return
+	}
+	_, _ = fmt.Fprint(os.Stdout, "stdout-only")
+	_, _ = fmt.Fprint(os.Stderr, "stderr-only")
+	os.Exit(0)
+}
+
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 	repo, err := filepath.Abs(filepath.Join("..", ".."))
@@ -900,11 +918,13 @@ func (h *harness) runOutput(t *testing.T, dir, name string, args ...string) stri
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Dir = dir
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("%s %s: %v\n%s", name, strings.Join(args, " "), err, output)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("%s %s: %v\nstdout=%s\nstderr=%s", name, strings.Join(args, " "), err, stdout.String(), stderr.String())
 	}
-	return string(output)
+	return stdout.String()
 }
 
 type pgClient struct {
